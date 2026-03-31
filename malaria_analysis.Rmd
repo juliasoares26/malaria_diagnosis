@@ -1,0 +1,1657 @@
+---
+title: "Comprehensive Malaria Analysis Deterministic vs Stochastic Optimization"
+subtitle: "Extended Analysis with Multiple Scenarios, Models, and Metrics"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 14,
+  fig.height = 10,
+  dpi = 300
+)
+```
+
+# Setup and Libraries
+
+```{r load-libraries}
+# Load required libraries with error handling
+required_packages <- c("tidyverse", "tidymodels", "themis", "tictoc", 
+                      "parallel", "doFuture", "finetune", "GA", 
+                      "patchwork", "glmnet", "xgboost", "nnet", 
+                      "kernlab", "kknn", "ranger", "yardstick", "Matrix")
+
+# Function to install and load packages
+load_package <- function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# Load all packages
+for (pkg in required_packages) {
+  tryCatch({
+    load_package(pkg)
+    cat("Loaded:", pkg, "\n")
+  }, error = function(e) {
+    cat("Warning: Could not load package", pkg, ":", e$message, "\n")
+  })
+}
+
+# Setup parallel processing
+tryCatch({
+  registerDoFuture()
+  plan(multisession, workers = min(3, parallel::detectCores() - 1))
+  cat("parallel processing configured with", min(3, parallel::detectCores() - 1), "workers\n")
+}, error = function(e) {
+  cat("Parallel processing setup failed, continuing sequentially\n")
+})
+
+# Set global options
+options(tidymodels.quiet = TRUE)
+set.seed(123)  # Global seed for reproducibility
+```
+
+```{r}
+# Enhanced Data Generation with Multiple Scenarios
+# Function to load and prepare external CSV data
+load_external_data <- function() {
+  tryCatch({
+    if (file.exists("Malaria-Data.csv")) {
+      external_data <- read_csv("Malaria-Data.csv", show_col_types = FALSE)
+      cat("Loaded external dataset: Malaria-Data.csv\n")
+      cat("Dimensions:", nrow(external_data), "×", ncol(external_data), "\n")
+      
+      # Print column names to help with target identification
+      cat("Column names:", paste(names(external_data), collapse = ", "), "\n")
+      
+      # Standardize the target variable name and ensure factor levels
+      if ("severe_maleria" %in% names(external_data)) {
+        external_data$severe_maleria <- factor(external_data$severe_maleria, 
+                                             levels = c(0, 1), 
+                                             labels = c("Not_severe", "Severe"))
+        cat("  - Found 'severe_maleria' column\n")
+      } else if (any(grepl("severe|target|class|outcome|label", names(external_data), ignore.case = TRUE))) {
+        target_col <- names(external_data)[grepl("severe|target|class|outcome|label", names(external_data), ignore.case = TRUE)][1]
+        names(external_data)[names(external_data) == target_col] <- "severe_maleria"
+        external_data$severe_maleria <- factor(external_data$severe_maleria, 
+                                             levels = c(0, 1), 
+                                             labels = c("Not_severe", "Severe"))
+        cat("  - Renamed target column '", target_col, "' to 'severe_maleria'\n")
+      } else {
+        # If no clear target column found, check for binary columns
+        binary_cols <- sapply(external_data, function(x) {
+          is.numeric(x) && all(x %in% c(0, 1, NA))
+        })
+        
+        if (any(binary_cols)) {
+          target_col <- names(external_data)[binary_cols][1]
+          names(external_data)[names(external_data) == target_col] <- "severe_maleria"
+          external_data$severe_maleria <- factor(external_data$severe_maleria, 
+                                               levels = c(0, 1), 
+                                               labels = c("Not_severe", "Severe"))
+          cat("  - Used binary column '", target_col, "' as target variable\n")
+        } else {
+          stop("Could not identify target variable. Please ensure your CSV has a column with 0/1 values for malaria severity.")
+        }
+      }
+      
+      # Remove any non-predictive columns (IDs, etc.)
+      id_cols <- grep("id|ID|index|Index", names(external_data), ignore.case = TRUE)
+      if (length(id_cols) > 0) {
+        external_data <- external_data[, -id_cols]
+        cat("Removed ID columns\n")
+      }
+      
+      # Ensure all predictors are numeric
+      predictor_cols <- names(external_data)[names(external_data) != "severe_maleria"]
+      for (col in predictor_cols) {
+        if (!is.numeric(external_data[[col]])) {
+          external_data[[col]] <- as.numeric(as.factor(external_data[[col]]))
+          cat("  - Converted", col, "to numeric\n")
+        }
+      }
+      
+      # Check for and handle missing values
+      missing_count <- sum(is.na(external_data))
+      if (missing_count > 0) {
+        cat("Found", missing_count, "missing values\n")
+        # Simple imputation with median for numeric variables
+        for (col in predictor_cols) {
+          if (any(is.na(external_data[[col]]))) {
+            median_val <- median(external_data[[col]], na.rm = TRUE)
+            external_data[[col]][is.na(external_data[[col]])] <- median_val
+            cat("    - Imputed", col, "with median value:", round(median_val, 3), "\n")
+          }
+        }
+      }
+      
+      if ("severe_maleria" %in% names(external_data)) {
+        severe_count <- sum(external_data$severe_maleria == "Severe", na.rm = TRUE)
+        total_count <- nrow(external_data)
+        cat("Target distribution: Severe =", severe_count, "/", total_count, 
+            "(", round(100 * severe_count / total_count, 1), "%)\n")
+        cat("Features available:", length(predictor_cols), "\n")
+        cat("Feature names:", paste(predictor_cols, collapse = ", "), "\n")
+      }
+      
+      return(external_data)
+    } else {
+      cat("external dataset 'Malaria-Data.csv' not found, skipping\n")
+      return(NULL)
+    }
+  }, error = function(e) {
+    cat("Error loading external dataset:", e$message, "\n")
+    return(NULL)
+  })
+}
+
+generate_malaria_data <- function(n_samples = 1000, scenario = "simple_linear") {
+  set.seed(123)
+  
+  # Define comprehensive scenario parameters
+  scenarios <- list(
+    simple_linear = list(
+      noise = 0.1,
+      correlation = 0.05,
+      coef = c(1.5, 1.2, 0.8, 1.0, 0.9, -1.3, -1.1, 0.7, 0.6, 0.8, 0.5, -0.4),
+      nonlinear = FALSE,
+      description = "Simple linear relationships with low noise"
+    ),
+    
+    complex_nonlinear = list(
+      noise = 0.2,
+      correlation = 0.3,
+      coef = c(1.2, -0.8, 0.6, 0.9, -1.1, 0.7, -0.5, 0.4, 0.3, -0.6, 0.2, -0.3),
+      nonlinear = TRUE,
+      interaction_strength = 0.5,
+      description = "Complex nonlinear with moderate interactions"
+    ),
+    
+    high_noise = list(
+      noise = 0.5,
+      correlation = 0.4,
+      coef = c(0.8, -0.6, 0.4, 0.7, -0.5, 0.3, -0.4, 0.2, 0.1, -0.3, 0.15, -0.2),
+      nonlinear = TRUE,
+      interaction_strength = 0.3,
+      description = "High noise scenario with weak signals"
+    ),
+    
+    highly_complex_nonlinear = list(
+      noise = 0.3,
+      correlation = 0.5,
+      coef = c(1.0, -1.2, 0.9, -0.7, 1.1, -0.8, 0.6, -0.4, 0.5, -0.9, 0.3, -0.6),
+      nonlinear = TRUE,
+      interaction_strength = 0.8,
+      polynomial_terms = TRUE,
+      description = "Highly complex with polynomial terms and strong interactions"
+    )
+  )
+  
+  params <- scenarios[[scenario]]
+  n_features <- length(params$coef)
+  
+  cat("Generating", scenario, "data:", params$description, "\n")
+  
+  # Generate features with correlation structure
+  if (params$correlation > 0) {
+    cor_matrix <- matrix(params$correlation, nrow = n_features, ncol = n_features)
+    diag(cor_matrix) <- 1
+    
+    # Add some random variation to correlation
+    for (i in 1:n_features) {
+      for (j in 1:n_features) {
+        if (i != j) {
+          cor_matrix[i, j] <- cor_matrix[i, j] * runif(1, 0.5, 1.5)
+        }
+      }
+    }
+    
+    # Ensure positive definite
+    cor_matrix <- as.matrix(Matrix::nearPD(cor_matrix)$mat)
+    L <- chol(cor_matrix)
+    Z <- matrix(rnorm(n_samples * n_features), nrow = n_samples)
+    X <- Z %*% L
+  } else {
+    X <- matrix(rnorm(n_samples * n_features), ncol = n_features)
+  }
+  
+  # Generate outcome with complexity
+  linear_pred <- X %*% params$coef
+  
+  # Add nonlinear terms if specified
+  if (params$nonlinear) {
+    # Add polynomial terms
+    if (!is.null(params$polynomial_terms) && params$polynomial_terms) {
+      poly_terms <- X[, 1:3]^2 * c(0.3, -0.2, 0.4)
+      linear_pred <- linear_pred + rowSums(poly_terms)
+    }
+    
+    # Add interaction terms
+    if (!is.null(params$interaction_strength)) {
+      interaction1 <- X[, 1] * X[, 2] * params$interaction_strength
+      interaction2 <- X[, 3] * X[, 4] * params$interaction_strength * 0.8
+      interaction3 <- sin(X[, 5]) * params$interaction_strength * 0.6
+      linear_pred <- linear_pred + interaction1 + interaction2 + interaction3
+    }
+  }
+  
+  # Add noise and convert to probabilities
+  linear_pred <- linear_pred + rnorm(n_samples, 0, params$noise)
+  prob_severe <- plogis(linear_pred)
+  severe_malaria <- rbinom(n_samples, 1, prob_severe)
+  
+  # Create data frame
+  feature_names <- c("fever", "vomiting", "fatigue", "headache", "nausea", 
+                    "loss_appetite", "abdominal_pain", "joint_pain", 
+                    "muscle_aches", "chills", "sweating", "cough")
+  
+  data <- data.frame(X)
+  names(data) <- feature_names
+  data$severe_maleria <- factor(severe_malaria, levels = c(0, 1), 
+                               labels = c("Not_severe", "Severe"))
+  
+  # Print data characteristics
+  cat("  - Severe cases:", sum(severe_malaria), "/", n_samples, 
+      "(", round(100 * mean(severe_malaria), 1), "%)\n")
+  
+  return(data)
+}
+
+# Generate all datasets
+cat("Generating synthetic datasets...\n")
+simple_linear <- generate_malaria_data(1000, "simple_linear")
+complex_nonlinear <- generate_malaria_data(1000, "complex_nonlinear") 
+high_noise <- generate_malaria_data(1000, "high_noise")
+highly_complex <- generate_malaria_data(1000, "highly_complex_nonlinear")
+
+# Load external data
+external_data <- load_external_data()
+
+# Combine all datasets
+all_datasets <- list(
+  "Simple Linear" = simple_linear,
+  "Complex Nonlinear" = complex_nonlinear,
+  "High Noise" = high_noise,
+  "Highly Complex Nonlinear" = highly_complex
+)
+
+if (!is.null(external_data)) {
+  all_datasets[["Real Malaria Dataset"]] <- external_data
+}
+
+cat("\nTotal datasets prepared:", length(all_datasets), "\n")
+```
+
+
+# Comprehensive Model Configuration
+
+```{r model-configuration}
+get_comprehensive_models <- function(train_data) {
+  n_features <- ncol(train_data) - 1
+  n_samples <- nrow(train_data)
+  
+  cat("Configuring models for", n_features, "features and", n_samples, "samples\n")
+  
+  models <- list(
+    # Logistic Regression
+    logreg = list(
+      name = "Logistic Regression",
+      model = logistic_reg(penalty = tune(), mixture = tune()) %>% 
+        set_engine("glmnet") %>% 
+        set_mode("classification"),
+      recipe = recipe(severe_maleria ~ ., data = train_data) %>%
+        step_normalize(all_predictors()) %>%
+        step_zv(all_predictors()) %>%
+        step_corr(all_predictors(), threshold = 0.95),
+      params = parameters(
+        penalty(range = c(-4, 1), trans = log10_trans()),
+        mixture(range = c(0, 1))
+      )
+    ),
+    
+    # Random Forest
+    rf = list(
+      name = "Random Forest",
+      model = rand_forest(
+        mtry = tune(), 
+        trees = tune(), 
+        min_n = tune()
+      ) %>% 
+        set_engine("ranger", importance = "impurity") %>% 
+        set_mode("classification"),
+      recipe = recipe(severe_maleria ~ ., data = train_data) %>%
+        step_zv(all_predictors()),
+      params = parameters(
+        mtry(range = c(2L, max(2L, n_features))),
+        trees(range = c(100L, 500L)),
+        min_n(range = c(2L, 20L))
+      )
+    ),
+    
+    # Support Vector Machine
+    svm = list(
+      name = "Support Vector Machine",
+      model = svm_rbf(cost = tune(), rbf_sigma = tune()) %>% 
+        set_engine("kernlab") %>% 
+        set_mode("classification"),
+      recipe = recipe(severe_maleria ~ ., data = train_data) %>%
+        step_normalize(all_predictors()) %>%
+        step_zv(all_predictors()) %>%
+        step_corr(all_predictors(), threshold = 0.95),
+      params = parameters(
+        cost(range = c(-2, 2), trans = log10_trans()),
+        rbf_sigma(range = c(-4, -1), trans = log10_trans())
+      )
+    ),
+    
+    # Neural Network
+    nnet = list(
+      name = "Neural Network",
+      model = mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>% 
+        set_engine("nnet", MaxNWts = 10000, trace = FALSE) %>% 
+        set_mode("classification"),
+      recipe = recipe(severe_maleria ~ ., data = train_data) %>%
+        step_normalize(all_predictors()) %>%
+        step_zv(all_predictors()) %>%
+        step_corr(all_predictors(), threshold = 0.95),
+      params = parameters(
+        hidden_units(range = c(5L, 20L)),
+        penalty(range = c(-4, -1), trans = log10_trans()),
+        epochs(range = c(50L, 200L))
+      )
+    ),
+    
+    # XGBoost
+    xgb = list(
+      name = "XGBoost",
+      model = boost_tree(
+        trees = tune(),
+        tree_depth = tune(),
+        learn_rate = tune(),
+        min_n = tune()
+      ) %>% 
+        set_engine("xgboost", verbosity = 0) %>% 
+        set_mode("classification"),
+      recipe = recipe(severe_maleria ~ ., data = train_data) %>%
+        step_zv(all_predictors()),
+      params = parameters(
+        trees(range = c(50L, 300L)),
+        tree_depth(range = c(3L, 8L)),
+        learn_rate(range = c(-2, -0.5), trans = log10_trans()),
+        min_n(range = c(2L, 10L))
+      )
+    ),
+    
+    # K-Nearest Neighbors
+    knn = list(
+      name = "K-Nearest Neighbors",
+      model = nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
+        set_engine("kknn") %>% 
+        set_mode("classification"),
+      recipe = recipe(severe_maleria ~ ., data = train_data) %>%
+        step_normalize(all_predictors()) %>%
+        step_zv(all_predictors()) %>%
+        step_corr(all_predictors(), threshold = 0.95),
+      params = parameters(
+        neighbors(range = c(3L, min(30L, n_samples %/% 5))),
+        weight_func(values = c("rectangular", "triangular", "gaussian"))
+      )
+    )
+  )
+  
+  cat("Configured", length(models), "models successfully\n")
+  return(models)
+}
+```
+
+# Control Functions and Tuning Methods
+
+```{r control-functions}
+# Ensure all control functions exist
+if (!exists("control_random") || is.null(control_random)) {
+  control_random <- function(verbose = FALSE, save_pred = FALSE, ...) {
+    control_grid(verbose = verbose, save_pred = save_pred, ...)
+  }
+}
+
+# Enhanced random search
+tune_random_enhanced <- function(object, resamples, param_info = NULL, size = 25, 
+                                metrics = NULL, control = control_grid()) {
+  if (is.null(metrics)) {
+    metrics <- metric_set(roc_auc, f_meas, accuracy, precision, recall, specificity)
+  }
+  
+  grid <- param_info %>% grid_random(size = size)
+  
+  result <- tune_grid(
+    object = object,
+    resamples = resamples,
+    grid = grid,
+    metrics = metrics,
+    control = control
+  )
+  
+  return(result)
+}
+
+# Enhanced genetic algorithm
+genetic_algorithm_tune <- function(workflow, resamples, param_info, 
+                                  pop_size = 10, max_iter = 15, verbose = FALSE) {
+  
+  cat("    GA Parameters: pop_size =", pop_size, ", max_iter =", max_iter, "\n")
+  
+  best_fitness <- 0
+  best_params <- NULL
+  generation_results <- list()
+  
+  for (iter in 1:max_iter) {
+    if (verbose) cat("Generation", iter, "of", max_iter, "\n")
+    
+    # Generate population
+    population <- param_info %>% grid_random(size = pop_size)
+    
+    # Evaluate each individual
+    for (ind in 1:nrow(population)) {
+      tryCatch({
+        individual <- as.list(population[ind, ])
+        final_wf <- finalize_workflow(workflow, individual)
+        
+        cv_results <- fit_resamples(
+          final_wf,
+          resamples = resamples,
+          metrics = metric_set(f_meas, roc_auc),
+          control = control_resamples(save_pred = FALSE, verbose = FALSE)
+        )
+        
+        fitness_f1 <- collect_metrics(cv_results) %>%
+          filter(.metric == "f_meas") %>%
+          pull(mean)
+        
+        fitness_auc <- collect_metrics(cv_results) %>%
+          filter(.metric == "roc_auc") %>%
+          pull(mean)
+        
+        # Combined fitness (weighted)
+        fitness <- ifelse(length(fitness_f1) > 0 && length(fitness_auc) > 0,
+                         0.7 * fitness_f1 + 0.3 * fitness_auc,
+                         0)
+        
+        if (fitness > best_fitness) {
+          best_fitness <- fitness
+          best_params <- individual
+        }
+        
+      }, error = function(e) {
+        # Skip failed individuals
+      })
+    }
+  }
+  
+  return(list(
+    best_params = best_params,
+    best_fitness = best_fitness,
+    converged = !is.null(best_params)
+  ))
+}
+```
+
+# Comprehensive Metrics Setup with Efficiency and Stability Tracking
+
+```{r metrics-setup}
+# Define comprehensive metric set
+comprehensive_metrics <- metric_set(
+  accuracy,      # Overall accuracy
+  f_meas,        # F1-score
+  precision,     # Precision
+  recall,        # Sensitivity/Recall
+  specificity,   # Specificity
+  roc_auc,       # ROC AUC
+  pr_auc,        # Precision-Recall AUC
+  bal_accuracy,  # Balanced Accuracy
+  kap,           # Cohen's Kappa
+  mcc            # Matthews Correlation Coefficient
+)
+
+# Global variables for tracking efficiency metrics
+evaluation_counter <- list()
+time_tracker <- list()
+
+# Function to track evaluations
+track_evaluation <- function(experiment_id) {
+  if (!experiment_id %in% names(evaluation_counter)) {
+    evaluation_counter[[experiment_id]] <<- 0
+  }
+  evaluation_counter[[experiment_id]] <<- evaluation_counter[[experiment_id]] + 1
+  return(evaluation_counter[[experiment_id]])
+}
+
+# Function to get evaluation count
+get_evaluation_count <- function(experiment_id) {
+  return(ifelse(experiment_id %in% names(evaluation_counter), 
+                evaluation_counter[[experiment_id]], 0))
+}
+
+# Function to reset counters
+reset_counters <- function() {
+  evaluation_counter <<- list()
+  time_tracker <<- list()
+}
+
+# Function to calculate all metrics manually (backup)
+calculate_comprehensive_metrics <- function(truth, estimate, prob_severe) {
+  
+  # Create confusion matrix components
+  tp <- sum(truth == "Severe" & estimate == "Severe")
+  tn <- sum(truth == "Not_severe" & estimate == "Not_severe")
+  fp <- sum(truth == "Not_severe" & estimate == "Severe")
+  fn <- sum(truth == "Severe" & estimate == "Not_severe")
+  
+  # Basic metrics
+  accuracy <- (tp + tn) / (tp + tn + fp + fn)
+  precision <- ifelse((tp + fp) == 0, 0, tp / (tp + fp))
+  recall <- ifelse((tp + fn) == 0, 0, tp / (tp + fn))  # Sensitivity
+  specificity <- ifelse((tn + fp) == 0, 0, tn / (tn + fp))
+  f1_score <- ifelse((precision + recall) == 0, 0, 2 * precision * recall / (precision + recall))
+  
+  # Balanced accuracy
+  balanced_acc <- (recall + specificity) / 2
+  
+  # Matthews Correlation Coefficient
+  mcc_num <- (tp * tn - fp * fn)
+  mcc_den <- sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+  mcc <- ifelse(mcc_den == 0, 0, mcc_num / mcc_den)
+  
+  # Cohen's Kappa
+  po <- accuracy
+  pe <- ((tp + fp) * (tp + fn) + (tn + fp) * (tn + fn)) / ((tp + tn + fp + fn)^2)
+  kappa <- ifelse(pe == 1, 0, (po - pe) / (1 - pe))
+  
+  roc_auc_val <- NA
+  tryCatch({
+    roc_auc_val <- yardstick::roc_auc_vec(truth, prob_severe, event_level = "second")
+  }, error = function(e) {
+    roc_auc_val <<- NA
+  })
+  
+  return(list(
+    accuracy = accuracy,
+    f1_score = f1_score,
+    precision = precision,
+    recall = recall,
+    specificity = specificity,
+    balanced_accuracy = balanced_acc,
+    mcc = mcc,
+    kappa = kappa,
+    roc_auc = roc_auc_val,
+    confusion_matrix = list(tp = tp, tn = tn, fp = fp, fn = fn)
+  ))
+}
+
+# Function to run multiple stability runs for stochastic methods
+run_stability_analysis <- function(workflow, resamples, param_info, opt_method, n_runs = 3) {
+  
+  results <- list()
+  
+  for (run in 1:n_runs) {
+    set.seed(123 + run * 100)  # Different seed for each run
+    
+    tryCatch({
+      if (opt_method == "random") {
+        result <- tune_random_enhanced(
+          workflow, resamples = resamples, param_info = param_info,
+          size = 15, metrics = metric_set(f_meas, accuracy, roc_auc),
+          control = control_grid(verbose = FALSE, save_pred = FALSE)
+        )
+      } else if (opt_method == "genetic") {
+        ga_result <- genetic_algorithm_tune(
+          workflow, resamples, param_info, pop_size = 8, max_iter = 10
+        )
+        if (ga_result$converged) {
+          # Convert GA result to standard format
+          best_params <- ga_result$best_params
+          final_wf <- finalize_workflow(workflow, best_params)
+          result <- fit_resamples(
+            final_wf, resamples = resamples, metrics = metric_set(f_meas, accuracy, roc_auc),
+            control = control_resamples(save_pred = FALSE, verbose = FALSE)
+          )
+        } else {
+          result <- NULL
+        }
+      } else {
+        result <- NULL
+      }
+      
+      if (!is.null(result)) {
+        best_result <- select_best(result, metric = "f_meas")
+        cv_metrics <- collect_metrics(result) %>%
+          filter(.config == best_result$.config)
+        
+        f1_score <- cv_metrics %>% filter(.metric == "f_meas") %>% pull(mean)
+        accuracy <- cv_metrics %>% filter(.metric == "accuracy") %>% pull(mean)
+        roc_auc <- cv_metrics %>% filter(.metric == "roc_auc") %>% pull(mean)
+        
+        results[[run]] <- list(
+          f1_score = ifelse(length(f1_score) > 0, f1_score, NA),
+          accuracy = ifelse(length(accuracy) > 0, accuracy, NA),
+          roc_auc = ifelse(length(roc_auc) > 0, roc_auc, NA)
+        )
+      }
+    }, error = function(e) {
+      results[[run]] <- list(f1_score = NA, accuracy = NA, roc_auc = NA)
+    })
+  }
+  
+  # Calculate stability metrics
+  f1_scores <- sapply(results, function(x) x$f1_score)
+  f1_scores <- f1_scores[!is.na(f1_scores)]
+  
+  if (length(f1_scores) > 1) {
+    return(list(
+      mean_f1 = mean(f1_scores),
+      sd_f1 = sd(f1_scores),
+      cv_f1 = sd(f1_scores) / mean(f1_scores),
+      min_f1 = min(f1_scores),
+      max_f1 = max(f1_scores),
+      n_successful_runs = length(f1_scores)
+    ))
+  } else {
+    return(list(
+      mean_f1 = ifelse(length(f1_scores) == 1, f1_scores[1], NA),
+      sd_f1 = NA,
+      cv_f1 = NA,
+      min_f1 = ifelse(length(f1_scores) == 1, f1_scores[1], NA),
+      max_f1 = ifelse(length(f1_scores) == 1, f1_scores[1], NA),
+      n_successful_runs = length(f1_scores)
+    ))
+  }
+}
+```
+
+# Main Analysis Function with Enhanced Tracking
+
+```{r main-analysis}
+run_comprehensive_analysis <- function(dataset, dataset_name) {
+  cat("\n", rep("=", 80), "\n")
+  cat("Analyzing:", dataset_name, "\n")
+  cat(rep("=", 80), "\n")
+  
+  # Reset counters for this dataset
+  reset_counters()
+  
+  # Data splitting with stratification
+  set.seed(700)
+  data_split <- initial_split(dataset, prop = 0.75, strata = severe_maleria)
+  train_data <- training(data_split)
+  test_data <- testing(data_split)
+  
+  # Create cross-validation folds - CHANGED TO 10-FOLD REPEATED 5 TIMES
+  cv_folds <- vfold_cv(train_data, v = 10, repeats = 5, strata = severe_maleria)
+  
+  # Get model configurations
+  models <- get_comprehensive_models(train_data)
+  
+  cat("Dataset info: n =", nrow(dataset), ", features =", ncol(dataset)-1, "\n")
+  cat("Models to test:", length(models), "\n")
+  cat("Cross-validation: 10-fold repeated 5 times (50 total folds)\n")
+  cat("Target distribution - Severe:", sum(dataset$severe_maleria == "Severe"), 
+      "/", nrow(dataset), "(", round(100 * mean(dataset$severe_maleria == "Severe"), 1), "%)\n")
+  
+  # Define optimization methods
+  opt_methods <- list(
+    # Deterministic methods
+    bayesian = list(name = "Bayesian Optimization", type = "Deterministic"),
+    grid = list(name = "Grid Search", type = "Deterministic"),
+    
+    # Stochastic methods  
+    random = list(name = "Random Search", type = "Stochastic"),
+    genetic = list(name = "Genetic Algorithm", type = "Stochastic"),
+    hyperband = list(name = "Hyperband Racing", type = "Stochastic")
+  )
+  
+  # Storage for results
+  all_results <- list()
+  total_experiments <- length(models) * length(opt_methods)
+  current_exp <- 0
+  
+  # Run experiments
+  for (model_name in names(models)) {
+    model_config <- models[[model_name]]
+    
+    for (opt_name in names(opt_methods)) {
+      current_exp <- current_exp + 1
+      opt_config <- opt_methods[[opt_name]]
+      experiment_id <- paste(dataset_name, model_name, opt_name, sep = "_")
+      
+      cat("\n[", current_exp, "/", total_experiments, "] Testing:", 
+          model_config$name, "with", opt_config$name, "\n")
+      
+      # Create workflow
+      wf <- workflow() %>%
+        add_recipe(model_config$recipe) %>%
+        add_model(model_config$model)
+      
+      # Time the optimization
+      start_time <- Sys.time()
+      
+      # Run optimization with evaluation tracking
+      opt_result <- NULL
+      best_params <- NULL
+      cv_metrics <- NULL
+      n_evaluations <- 0
+      
+      tryCatch({
+        if (opt_name == "bayesian") {
+          n_evaluations <- 8 + 12  # initial + iter
+          opt_result <- tune_bayes(
+            wf, resamples = cv_folds, param_info = model_config$params,
+            initial = 8, iter = 12, metrics = comprehensive_metrics,
+            control = control_bayes(verbose = FALSE, save_pred = FALSE, no_improve = 8)
+          )
+        } else if (opt_name == "grid") {
+          n_evaluations <- 20
+          opt_result <- tune_grid(
+            wf, resamples = cv_folds, param_info = model_config$params,
+            grid = 20, metrics = comprehensive_metrics,
+            control = control_grid(verbose = FALSE, save_pred = FALSE)
+          )
+        } else if (opt_name == "random") {
+          n_evaluations <- 25
+          opt_result <- tune_random_enhanced(
+            wf, resamples = cv_folds, param_info = model_config$params,
+            size = 25, metrics = comprehensive_metrics,
+            control = control_grid(verbose = FALSE, save_pred = FALSE)
+          )
+        } else if (opt_name == "genetic") {
+          n_evaluations <- 12 * 15  # pop_size * max_iter
+          ga_result <- genetic_algorithm_tune(
+            wf, cv_folds, model_config$params, pop_size = 12, max_iter = 15
+          )
+          if (ga_result$converged) {
+            best_params <- ga_result$best_params
+            # Get CV metrics for best params
+            final_wf <- finalize_workflow(wf, best_params)
+            cv_results <- fit_resamples(
+              final_wf, resamples = cv_folds, metrics = comprehensive_metrics,
+              control = control_resamples(save_pred = FALSE, verbose = FALSE)
+            )
+            cv_metrics <- collect_metrics(cv_results)
+          }
+        } else if (opt_name == "hyperband") {
+          n_evaluations <- 20  # base grid size
+          opt_result <- tune_race_anova(
+            wf, resamples = cv_folds, param_info = model_config$params,
+            grid = 20, metrics = comprehensive_metrics,
+            control = control_race(verbose = FALSE, save_workflow = FALSE)
+          )
+        }
+        
+        # Track evaluations
+        for (i in 1:n_evaluations) {
+          track_evaluation(experiment_id)
+        }
+        
+      }, error = function(e) {
+        cat("ERROR in optimization:", substr(e$message, 1, 80), "...\n")
+        opt_result <- NULL
+      })
+      
+      end_time <- Sys.time()
+      training_time <- as.numeric(difftime(end_time, start_time, units = "mins"))
+      
+      # Calculate efficiency metrics
+      efficiency_score <- ifelse(training_time > 0, n_evaluations / training_time, 0)
+      time_per_evaluation <- ifelse(n_evaluations > 0, training_time / n_evaluations, 0)
+      if (!is.null(opt_result) && opt_name != "genetic") {
+        tryCatch({
+          best_result <- select_best(opt_result, metric = "f_meas")
+          best_params <- as.list(best_result[names(best_result) != ".config"])
+          cv_metrics <- collect_metrics(opt_result) %>%
+            filter(.config == best_result$.config)
+        }, error = function(e) {
+          cat("    ⚠ Error extracting CV results:", e$message, "\n")
+          best_params <- NULL
+          cv_metrics <- NULL
+        })
+      }
+
+      # Run stability analysis for stochastic methods
+      stability_metrics <- NULL
+      if (opt_config$type == "Stochastic" && !is.null(best_params)) {
+        cat("Running stability analysis...\n")
+        stability_metrics <- run_stability_analysis(wf, cv_folds, model_config$params, opt_name)
+      }
+      
+      # Test evaluation with comprehensive metrics
+      test_metrics <- NULL
+      if (!is.null(best_params) && !any(is.na(unlist(best_params)))) {
+        tryCatch({
+          # Fit final model
+          final_wf <- finalize_workflow(wf, best_params)
+          final_fit <- fit(final_wf, train_data)
+          
+          # Predictions
+          test_pred_class <- predict(final_fit, test_data)
+          test_pred_prob <- predict(final_fit, test_data, type = "prob")
+          
+          # Calculate comprehensive metrics
+          test_results_df <- test_data %>%
+            select(severe_maleria) %>%
+            bind_cols(test_pred_class) %>%
+            bind_cols(test_pred_prob)
+          
+          # Use manual calculation as backup
+          manual_metrics <- calculate_comprehensive_metrics(
+            truth = test_results_df$severe_maleria,
+            estimate = test_results_df$.pred_class,
+            prob_severe = test_results_df$.pred_Severe
+          )
+          
+          test_metrics <- manual_metrics
+          
+        }, error = function(e) {
+          cat("Error in test evaluation:", e$message, "\n")
+          test_metrics <- NULL
+        })
+      }
+      
+      # Store results with enhanced metrics
+      if (!is.null(best_params) && (!is.null(cv_metrics) || !is.null(test_metrics))) {
+        
+        # Extract CV metrics
+        cv_f1 <- if (!is.null(cv_metrics)) {
+          cv_f1_val <- cv_metrics %>% filter(.metric == "f_meas") %>% pull(mean)
+          ifelse(length(cv_f1_val) > 0, cv_f1_val, NA)
+        } else { NA }
+        
+        cv_accuracy <- if (!is.null(cv_metrics)) {
+          cv_acc_val <- cv_metrics %>% filter(.metric == "accuracy") %>% pull(mean)
+          ifelse(length(cv_acc_val) > 0, cv_acc_val, NA)
+        } else { NA }
+        
+        cv_roc_auc <- if (!is.null(cv_metrics)) {
+          cv_auc_val <- cv_metrics %>% filter(.metric == "roc_auc") %>% pull(mean)
+          ifelse(length(cv_auc_val) > 0, cv_auc_val, NA)
+        } else { NA }
+        
+        # Create comprehensive result row
+        result_row <- data.frame(
+          dataset = dataset_name,
+          model = model_name,
+          model_name = model_config$name,
+          optimization_method = opt_config$name,
+          optimization_type = opt_config$type,
+          
+          # Cross-validation metrics
+          cv_f1_score = cv_f1,
+          cv_accuracy = cv_accuracy,
+          cv_roc_auc = cv_roc_auc,
+          
+          # Test metrics
+          test_accuracy = ifelse(is.null(test_metrics), NA, test_metrics$accuracy),
+          test_f1_score = ifelse(is.null(test_metrics), NA, test_metrics$f1_score),
+          test_precision = ifelse(is.null(test_metrics), NA, test_metrics$precision),
+          test_recall = ifelse(is.null(test_metrics), NA, test_metrics$recall),
+          test_specificity = ifelse(is.null(test_metrics), NA, test_metrics$specificity),
+          test_roc_auc = ifelse(is.null(test_metrics), NA, test_metrics$roc_auc),
+          test_balanced_accuracy = ifelse(is.null(test_metrics), NA, test_metrics$balanced_accuracy),
+          test_mcc = ifelse(is.null(test_metrics), NA, test_metrics$mcc),
+          test_kappa = ifelse(is.null(test_metrics), NA, test_metrics$kappa),
+          
+          # Efficiency metrics
+          training_time_minutes = training_time,
+          n_evaluations = n_evaluations,
+          efficiency_score = efficiency_score,
+          time_per_evaluation = time_per_evaluation,
+          
+          # Stability metrics (for stochastic methods)
+          stability_mean_f1 = ifelse(is.null(stability_metrics), NA, stability_metrics$mean_f1),
+          stability_sd_f1 = ifelse(is.null(stability_metrics), NA, stability_metrics$sd_f1),
+          stability_cv_f1 = ifelse(is.null(stability_metrics), NA, stability_metrics$cv_f1),
+          stability_range_f1 = ifelse(is.null(stability_metrics), NA, 
+                                     stability_metrics$max_f1 - stability_metrics$min_f1),
+          n_successful_runs = ifelse(is.null(stability_metrics), NA, stability_metrics$n_successful_runs),
+          
+          stringsAsFactors = FALSE
+        )
+        
+        all_results[[experiment_id]] <- result_row
+        
+        # Print summary
+        cat("CV: F1=", round(cv_f1, 3), "ACC=", round(cv_accuracy, 3), "AUC=", round(cv_roc_auc, 3), "\n")
+        if (!is.null(test_metrics)) {
+          cat("Test: F1=", round(test_metrics$f1_score, 3), 
+              "ACC=", round(test_metrics$accuracy, 3), 
+              "AUC=", round(ifelse(is.na(test_metrics$roc_auc), 0, test_metrics$roc_auc), 3), "\n")
+        }
+        cat("Efficiency: ", n_evaluations, "evals in", round(training_time, 2), "min",
+            "(", round(time_per_evaluation * 60, 1), "sec/eval)\n")
+        
+        if (!is.null(stability_metrics)) {
+          cat("Stability: SD=", round(stability_metrics$sd_f1, 4), 
+              "CV=", round(stability_metrics$cv_f1, 3), "\n")
+        }
+        
+      } else {
+        cat("failed - no valid results\n")
+      }
+    }
+  }
+  
+  # Combine results
+  if (length(all_results) > 0) {
+    return(do.call(rbind, all_results))
+  } else {
+    return(data.frame())
+  }
+}
+```
+
+# Execute Comprehensive Analysis
+
+```{r execute-comprehensive-analysis}
+# Run comprehensive analysis on all datasets
+final_results <- data.frame()
+dataset_summaries <- list()
+
+for (i in seq_along(all_datasets)) {
+  dataset_name <- names(all_datasets)[i]
+  dataset <- all_datasets[[i]]
+  
+  cat("\n", rep("=", 90), "\n")
+  cat("Processing Dataset:", dataset_name, "\n")
+  cat(rep("=", 90), "\n")
+  
+  results <- tryCatch({
+    run_comprehensive_analysis(dataset, dataset_name)
+  }, error = function(e) {
+    cat("Error Processing", dataset_name, ":", e$message, "\n")
+    data.frame()
+  })
+  
+  if (nrow(results) > 0) {
+    final_results <- rbind(final_results, results)
+    cat("Successfully added", nrow(results), "results from", dataset_name, "\n")
+    
+    # Store dataset summary
+    dataset_summaries[[dataset_name]] <- list(
+      n_experiments = nrow(results),
+      n_successful = sum(!is.na(results$test_f1_score)),
+      best_f1 = max(results$test_f1_score, na.rm = TRUE),
+      best_accuracy = max(results$test_accuracy, na.rm = TRUE)
+    )
+  } else {
+    cat("No results obtained from", dataset_name, "\n")
+  }
+}
+
+# Final Analysis Summary
+cat("\n", rep("=", 90), "\n")
+cat("Comprehensive Analysis Completed\n")
+cat(rep("=", 90), "\n")
+
+if (nrow(final_results) > 0) {
+  cat("Overall Statistics\n")
+  cat("Total experiments conducted:", nrow(final_results), "\n")
+  cat("Successful experiments:", sum(!is.na(final_results$test_f1_score)), "\n")
+  cat("Success rate:", round(100 * sum(!is.na(final_results$test_f1_score)) / nrow(final_results), 1), "%\n")
+  
+  valid_results <- final_results[!is.na(final_results$test_f1_score), ]
+  
+  if (nrow(valid_results) > 0) {
+    cat("\nPerformance Highlights:\n")
+    cat("Best F1-Score:", round(max(valid_results$test_f1_score), 4), "\n")
+    cat("Best Accuracy:", round(max(valid_results$test_accuracy), 4), "\n")
+    cat("Best ROC-AUC:", round(max(valid_results$test_roc_auc, na.rm = TRUE), 4), "\n")
+    cat("Average F1-Score:", round(mean(valid_results$test_f1_score), 4), "\n")
+    
+    # Best performing combination
+    best_idx <- which.max(valid_results$test_f1_score)
+    best_combo <- valid_results[best_idx, ]
+    
+    cat("\n Best Performance Combination:\n")
+    cat("Dataset:", best_combo$dataset, "\n")
+    cat("Model:", best_combo$model_name, "\n")
+    cat("Optimization:", best_combo$optimization_method, "\n")
+    cat("F1-Score:", round(best_combo$test_f1_score, 4), "\n")
+    cat("Accuracy:", round(best_combo$test_accuracy, 4), "\n")
+    cat("ROC-AUC:", round(best_combo$test_roc_auc, 4), "\n")
+  }
+}
+```
+
+# Advanced Statistical Analysis
+
+```{r advanced-statistical-analysis}
+if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
+  
+  valid_results <- final_results[!is.na(final_results$test_f1_score), ]
+  
+  cat("\n", rep("=", 80), "\n")
+  cat("Advanced Statistical Analysis\n")
+  cat(rep("=", 80), "\n")
+  
+  # Deterministic vs Stochastic Comparison
+  cat("\n Determinist vs StochasticN:\n")
+  
+  type_comparison <- valid_results %>%
+    group_by(optimization_type) %>%
+    summarise(
+      n_experiments = n(),
+      mean_f1 = mean(test_f1_score, na.rm = TRUE),
+      sd_f1 = sd(test_f1_score, na.rm = TRUE),
+      mean_accuracy = mean(test_accuracy, na.rm = TRUE),
+      sd_accuracy = sd(test_accuracy, na.rm = TRUE),
+      mean_roc_auc = mean(test_roc_auc, na.rm = TRUE),
+      mean_time = mean(training_time_minutes, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    arrange(desc(mean_f1))
+  
+  print(type_comparison)
+  
+  # Statistical significance test
+  det_results <- valid_results$test_f1_score[valid_results$optimization_type == "Deterministic"]
+  sto_results <- valid_results$test_f1_score[valid_results$optimization_type == "Stochastic"]
+  
+  if (length(det_results) > 2 && length(sto_results) > 2) {
+    tryCatch({
+      t_test <- t.test(det_results, sto_results)
+      wilcox_test <- wilcox.test(det_results, sto_results)
+      
+      cat("\nStatistical Tests\n")
+      cat("Welch's t-test p-value:", round(t_test$p.value, 4), "\n")
+      cat("Mann-Whitney U p-value:", round(wilcox_test$p.value, 4), "\n")
+      cat("Significant difference (α=0.05):", 
+          ifelse(min(t_test$p.value, wilcox_test$p.value) < 0.05, "YES", "NO"), "\n")
+      
+      if (mean(det_results) > mean(sto_results)) {
+        cat("Deterministic methods outperform stochastic by", 
+            round((mean(det_results) - mean(sto_results)) * 100, 2), "percentage points\n")
+      } else {
+        cat("Stochastic methods outperform deterministic by", 
+            round((mean(sto_results) - mean(det_results)) * 100, 2), "percentage points\n")
+      }
+    }, error = function(e) {
+      cat("Could not perform statistical tests\n")
+    })
+  }
+  
+  # Model Performance Analysis
+  cat("\n Model Performance Ranking\n")
+  
+  model_performance <- valid_results %>%
+    group_by(model_name) %>%
+    summarise(
+      n_experiments = n(),
+      mean_f1 = mean(test_f1_score, na.rm = TRUE),
+      sd_f1 = sd(test_f1_score, na.rm = TRUE),
+      mean_accuracy = mean(test_accuracy, na.rm = TRUE),
+      mean_precision = mean(test_precision, na.rm = TRUE),
+      mean_recall = mean(test_recall, na.rm = TRUE),
+      mean_roc_auc = mean(test_roc_auc, na.rm = TRUE),
+      consistency = sd(test_f1_score, na.rm = TRUE) / mean(test_f1_score, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    arrange(desc(mean_f1))
+  
+  print(model_performance)
+  
+  # Optimization Method Analysis
+  cat("\n Optimization Method Analysis:\n")
+  
+  method_performance <- valid_results %>%
+    group_by(optimization_method, optimization_type) %>%
+    summarise(
+      n_experiments = n(),
+      mean_f1 = mean(test_f1_score, na.rm = TRUE),
+      sd_f1 = sd(test_f1_score, na.rm = TRUE),
+      mean_accuracy = mean(test_accuracy, na.rm = TRUE),
+      mean_time = mean(training_time_minutes, na.rm = TRUE),
+      efficiency = mean(test_f1_score, na.rm = TRUE) / mean(training_time_minutes, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    arrange(desc(mean_f1))
+  
+  print(method_performance)
+  
+  # Dataset Complexity Analysis
+  cat("\n Dataset Complexity Analysis:\n")
+  
+  dataset_performance <- valid_results %>%
+    group_by(dataset) %>%
+    summarise(
+      n_experiments = n(),
+      mean_f1 = mean(test_f1_score, na.rm = TRUE),
+      sd_f1 = sd(test_f1_score, na.rm = TRUE),
+      best_f1 = max(test_f1_score, na.rm = TRUE),
+      worst_f1 = min(test_f1_score, na.rm = TRUE),
+      range_f1 = max(test_f1_score, na.rm = TRUE) - min(test_f1_score, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    arrange(desc(mean_f1))
+  
+  print(dataset_performance)
+  
+  # Model-Method Interaction Analysis
+  cat("\n Best Model-Method Interaction:\n")
+  
+  best_combinations <- valid_results %>%
+    group_by(model_name, optimization_method) %>%
+    summarise(
+      mean_f1 = mean(test_f1_score, na.rm = TRUE),
+      mean_accuracy = mean(test_accuracy, na.rm = TRUE),
+      mean_time = mean(training_time_minutes, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    arrange(desc(mean_f1)) %>%
+    head(10)
+  
+  print(best_combinations)
+  
+  # Efficiency Analysis
+  cat("\n Efficiency Analysis:\n")
+  
+  efficiency_analysis <- valid_results %>%
+    group_by(optimization_method, optimization_type) %>%
+    summarise(
+      mean_efficiency = mean(efficiency_score, na.rm = TRUE),
+      mean_time_per_eval = mean(time_per_evaluation, na.rm = TRUE),
+      mean_total_time = mean(training_time_minutes, na.rm = TRUE),
+      mean_evaluations = mean(n_evaluations, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    arrange(desc(mean_efficiency))
+  
+  print(efficiency_analysis)
+  
+  # Stability Analysis for Stochastic Methods
+  cat("\n Stability Analysis:\n")
+  
+  stability_results <- valid_results %>%
+    filter(optimization_type == "Stochastic", !is.na(stability_cv_f1)) %>%
+    group_by(optimization_method) %>%
+    summarise(
+      n_experiments = n(),
+      mean_stability_cv = mean(stability_cv_f1, na.rm = TRUE),
+      mean_stability_sd = mean(stability_sd_f1, na.rm = TRUE),
+      mean_stability_range = mean(stability_range_f1, na.rm = TRUE),
+      avg_successful_runs = mean(n_successful_runs, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    arrange(mean_stability_cv)
+  
+  if (nrow(stability_results) > 0) {
+    print(stability_results)
+  } else {
+    cat("No stability data available for stochastic methods\n")
+  }
+}
+```
+
+# Comprehensive Visualizations
+
+```{r comprehensive-visualizations}
+if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
+  
+  valid_results <- final_results[!is.na(final_results$test_f1_score), ]
+  
+  # Load ggplot2 for visualizations
+  library(ggplot2)
+  library(patchwork)
+  
+  # Deterministic vs Stochastic Comparison
+  p1 <- ggplot(valid_results, aes(x = optimization_type, y = test_f1_score, 
+                                  fill = optimization_type)) +
+    geom_violin(alpha = 0.7, width = 0.8) +
+    geom_boxplot(width = 0.3, alpha = 0.8) +
+    geom_jitter(width = 0.1, alpha = 0.5, size = 1.5) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(title = "F1-Score: Deterministic vs Stochastic Methods",
+         x = "Optimization Type", y = "Test F1-Score") +
+    scale_fill_manual(values = c("Deterministic" = "#2E86AB", "Stochastic" = "#A23B72"))
+  
+  # Model Performance Comparison
+  p2 <- ggplot(valid_results, aes(x = reorder(model_name, test_f1_score), 
+                                  y = test_f1_score, fill = model_name)) +
+    geom_violin(alpha = 0.7) +
+    geom_boxplot(width = 0.3, alpha = 0.8) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none") +
+    labs(title = "Model Performance Comparison",
+         x = "Model", y = "Test F1-Score")
+  
+  # Optimization Method Detailed Comparison
+  p3 <- ggplot(valid_results, aes(x = reorder(optimization_method, test_f1_score), 
+                                  y = test_f1_score, fill = optimization_type)) +
+    geom_violin(alpha = 0.7) +
+    geom_boxplot(width = 0.4, alpha = 0.8) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = "Optimization Method Performance",
+         x = "Optimization Method", y = "Test F1-Score",
+         fill = "Method Type") +
+    scale_fill_manual(values = c("Deterministic" = "#2E86AB", "Stochastic" = "#A23B72"))
+  
+  # Performance vs Time Trade-off
+  p4 <- ggplot(valid_results, aes(x = training_time_minutes, y = test_f1_score, 
+                                  color = optimization_type, shape = model_name)) +
+    geom_point(size = 2.5, alpha = 0.7) +
+    geom_smooth(aes(group = optimization_type), method = "lm", se = FALSE) +
+    theme_minimal() +
+    labs(title = "Performance vs Training Time",
+         x = "Training Time (minutes)", y = "Test F1-Score",
+         color = "Optimization Type", shape = "Model") +
+    scale_color_manual(values = c("Deterministic" = "#2E86AB", "Stochastic" = "#A23B72"))
+  
+  # Dataset Complexity Impact
+  p5 <- ggplot(valid_results, aes(x = reorder(dataset, test_f1_score), 
+                                  y = test_f1_score, fill = dataset)) +
+    geom_violin(alpha = 0.7) +
+    geom_boxplot(width = 0.3, alpha = 0.8) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none") +
+    labs(title = "Performance by Dataset Complexity",
+         x = "Dataset", y = "Test F1-Score")
+  
+  # 6. Multi-metric Comparison
+  metrics_long <- valid_results %>%
+    select(optimization_type, test_accuracy, test_f1_score, test_precision, 
+           test_recall, test_specificity) %>%
+    pivot_longer(cols = starts_with("test_"), 
+                 names_to = "metric", 
+                 values_to = "value") %>%
+    mutate(metric = str_remove(metric, "test_")) %>%
+    filter(!is.na(value))
+  
+  p6 <- ggplot(metrics_long, aes(x = metric, y = value, fill = optimization_type)) +
+    geom_violin(alpha = 0.7, position = "dodge") +
+    geom_boxplot(width = 0.2, alpha = 0.8, position = position_dodge(0.9)) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = "Multi-Metric Performance Comparison",
+         x = "Metric", y = "Score", fill = "Optimization Type") +
+    scale_fill_manual(values = c("Deterministic" = "#2E86AB", "Stochastic" = "#A23B72"))
+  
+  # Efficiency Analysis Plot
+  p7 <- ggplot(valid_results, aes(x = efficiency_score, y = test_f1_score, 
+                                  color = optimization_type, size = training_time_minutes)) +
+    geom_point(alpha = 0.7) +
+    theme_minimal() +
+    labs(title = "Efficiency vs Performance Trade-off",
+         x = "Efficiency Score (Evaluations/Minute)", y = "Test F1-Score",
+         color = "Optimization Type", size = "Training Time (min)") +
+    scale_color_manual(values = c("Deterministic" = "#2E86AB", "Stochastic" = "#A23B72"))
+  
+  # Stability Analysis Plot 
+  stochastic_results <- valid_results %>% 
+    filter(optimization_type == "Stochastic", !is.na(stability_cv_f1))
+  
+  if (nrow(stochastic_results) > 0) {
+    p8 <- ggplot(stochastic_results, aes(x = stability_cv_f1, y = test_f1_score, 
+                                         color = optimization_method)) +
+      geom_point(size = 3, alpha = 0.7) +
+      theme_minimal() +
+      labs(title = "Stability vs Performance (Stochastic Methods)",
+           x = "Coefficient of Variation (F1)", y = "Test F1-Score",
+           color = "Method") +
+      scale_x_reverse()  # Lower CV = better stability
+  }
+  
+  # Combine plots
+  combined_plot1 <- (p1 | p2) / (p3 | p4)
+  combined_plot2 <- (p5 | p6) / (p7 | if(exists("p8")) p8 else plot_spacer())
+  
+  print(combined_plot1)
+  print(combined_plot2)
+  
+  # Correlation Matrix of Metrics
+  if (nrow(valid_results) > 5) {
+    correlation_data <- valid_results %>%
+      select(test_accuracy, test_f1_score, test_precision, test_recall, 
+             test_specificity, test_roc_auc, training_time_minutes, 
+             efficiency_score, n_evaluations) %>%
+      cor(use = "complete.obs")
+    
+    # Convert to long format for ggplot
+    cor_long <- correlation_data %>%
+      as.data.frame() %>%
+      rownames_to_column("var1") %>%
+      pivot_longer(-var1, names_to = "var2", values_to = "correlation")
+    
+    p9 <- ggplot(cor_long, aes(x = var1, y = var2, fill = correlation)) +
+      geom_tile() +
+      geom_text(aes(label = round(correlation, 2)), size = 3) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(title = "Correlation Matrix of Performance Metrics",
+           x = "", y = "", fill = "Correlation") +
+      scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0)
+    
+    print(p9)
+  }
+}
+```
+
+# Export Results and Final Summary
+
+```{r export-comprehensive-results}
+if (nrow(final_results) > 0) {
+  
+  # Export main results
+  write_csv(final_results, "comprehensive_malaria_analysis_results.csv")
+  cat("Main results exported to: comprehensive_malaria_analysis_results.csv\n")
+  
+  valid_results <- final_results[!is.na(final_results$test_f1_score), ]
+  
+  if (nrow(valid_results) > 0) {
+    
+    # Model Performance Summary
+    model_summary <- valid_results %>%
+      group_by(model_name) %>%
+      summarise(
+        experiments = n(),
+        mean_f1 = round(mean(test_f1_score), 4),
+        sd_f1 = round(sd(test_f1_score), 4),
+        mean_accuracy = round(mean(test_accuracy), 4),
+        mean_precision = round(mean(test_precision, na.rm = TRUE), 4),
+        mean_recall = round(mean(test_recall, na.rm = TRUE), 4),
+        mean_roc_auc = round(mean(test_roc_auc, na.rm = TRUE), 4),
+        best_f1 = round(max(test_f1_score), 4),
+        consistency_cv = round(sd(test_f1_score) / mean(test_f1_score), 3),
+        mean_training_time = round(mean(training_time_minutes), 2),
+        .groups = 'drop'
+      ) %>%
+      arrange(desc(mean_f1))
+    
+    write_csv(model_summary, "model_performance_comprehensive.csv")
+    cat("Model summary exported to: model_performance_comprehensive.csv\n")
+    
+    # Optimization Method Summary
+    method_summary <- valid_results %>%
+      group_by(optimization_method, optimization_type) %>%
+      summarise(
+        experiments = n(),
+        mean_f1 = round(mean(test_f1_score), 4),
+        sd_f1 = round(sd(test_f1_score), 4),
+        mean_accuracy = round(mean(test_accuracy), 4),
+        mean_time_min = round(mean(training_time_minutes), 2),
+        mean_efficiency = round(mean(efficiency_score, na.rm = TRUE), 4),
+        mean_evaluations = round(mean(n_evaluations), 0),
+        best_f1 = round(max(test_f1_score), 4),
+        .groups = 'drop'
+      ) %>%
+      arrange(desc(mean_f1))
+    
+    write_csv(method_summary, "optimization_methods_comprehensive.csv")
+    cat("Method summary exported to: optimization_methods_comprehensive.csv\n")
+  
+    # Dataset Analysis Summary
+    dataset_summary <- valid_results %>%
+      group_by(dataset) %>%
+      summarise(
+        experiments = n(),
+        mean_f1 = round(mean(test_f1_score), 4),
+        sd_f1 = round(sd(test_f1_score), 4),
+        best_f1 = round(max(test_f1_score), 4),
+        worst_f1 = round(min(test_f1_score), 4),
+        range_f1 = round(max(test_f1_score) - min(test_f1_score), 4),
+        mean_accuracy = round(mean(test_accuracy), 4),
+        predictability = round(1 - (sd(test_f1_score) / mean(test_f1_score)), 3),
+        mean_training_time = round(mean(training_time_minutes), 2),
+        .groups = 'drop'
+      ) %>%
+      arrange(desc(mean_f1))
+    
+    write_csv(dataset_summary, "dataset_complexity_analysis.csv")
+    cat("Dataset analysis exported to: dataset_complexity_analysis.csv\n")
+    
+    # Best Combinations
+    best_combinations <- valid_results %>%
+      group_by(dataset, model_name, optimization_method) %>%
+      summarise(
+        f1_score = max(test_f1_score),
+        accuracy = test_accuracy[which.max(test_f1_score)],
+        precision = test_precision[which.max(test_f1_score)],
+        recall = test_recall[which.max(test_f1_score)],
+        roc_auc = test_roc_auc[which.max(test_f1_score)],
+        time_min = training_time_minutes[which.max(test_f1_score)],
+        efficiency = efficiency_score[which.max(test_f1_score)],
+        optimization_type = first(optimization_type),
+        .groups = 'drop'
+      ) %>%
+      arrange(desc(f1_score)) %>%
+      head(20)
+    
+    write_csv(best_combinations, "top_20_combinations.csv")
+    cat("Top combinations exported to: top_20_combinations.csv\n")
+    
+    # Efficiency Analysis Summary
+    efficiency_summary <- valid_results %>%
+      group_by(optimization_method, optimization_type) %>%
+      summarise(
+        experiments = n(),
+        mean_efficiency_score = round(mean(efficiency_score, na.rm = TRUE), 4),
+        sd_efficiency_score = round(sd(efficiency_score, na.rm = TRUE), 4),
+        mean_time_per_eval = round(mean(time_per_evaluation, na.rm = TRUE), 4),
+        mean_total_evaluations = round(mean(n_evaluations), 0),
+        mean_total_time = round(mean(training_time_minutes), 2),
+        efficiency_rank = rank(-mean(efficiency_score, na.rm = TRUE)),
+        .groups = 'drop'
+      ) %>%
+      arrange(desc(mean_efficiency_score))
+    
+    write_csv(efficiency_summary, "efficiency_analysis.csv")
+    cat("Efficiency analysis exported to: efficiency_analysis.csv\n")
+    
+    # Statistical Analysis Summary
+    det_results <- valid_results$test_f1_score[valid_results$optimization_type == "Deterministic"]
+    sto_results <- valid_results$test_f1_score[valid_results$optimization_type == "Stochastic"]
+    
+    if (length(det_results) > 2 && length(sto_results) > 2) {
+      stat_summary <- data.frame(
+        deterministic_mean = round(mean(det_results), 4),
+        deterministic_sd = round(sd(det_results), 4),
+        deterministic_n = length(det_results),
+        stochastic_mean = round(mean(sto_results), 4),
+        stochastic_sd = round(sd(sto_results), 4),
+        stochastic_n = length(sto_results),
+        difference = round(mean(det_results) - mean(sto_results), 4),
+        effect_size_cohens_d = round((mean(det_results) - mean(sto_results)) / 
+                                   sqrt(((length(det_results)-1)*var(det_results) + 
+                                        (length(sto_results)-1)*var(sto_results)) / 
+                                        (length(det_results) + length(sto_results) - 2)), 4),
+        t_test_pvalue = tryCatch(round(t.test(det_results, sto_results)$p.value, 6), 
+                               error = function(e) NA),
+        wilcox_test_pvalue = tryCatch(round(wilcox.test(det_results, sto_results)$p.value, 6), 
+                                    error = function(e) NA)
+      )
+      
+      write_csv(stat_summary, "statistical_comparison_summary.csv")
+      cat("Statistical summary exported to: statistical_comparison_summary.csv\n")
+    }
+    
+    # Stability Analysis Summary
+    stability_data <- valid_results %>%
+      filter(optimization_type == "Stochastic", !is.na(stability_cv_f1))
+    
+    if (nrow(stability_data) > 0) {
+      stability_summary <- stability_data %>%
+        group_by(optimization_method) %>%
+        summarise(
+          experiments = n(),
+          mean_stability_cv = round(mean(stability_cv_f1, na.rm = TRUE), 4),
+          sd_stability_cv = round(sd(stability_cv_f1, na.rm = TRUE), 4),
+          mean_stability_sd = round(mean(stability_sd_f1, na.rm = TRUE), 4),
+          mean_stability_range = round(mean(stability_range_f1, na.rm = TRUE), 4),
+          avg_successful_runs = round(mean(n_successful_runs, na.rm = TRUE), 1),
+          most_stable = rank(mean(stability_cv_f1, na.rm = TRUE)),
+          .groups = 'drop'
+        ) %>%
+        arrange(mean_stability_cv)
+      
+      write_csv(stability_summary, "stability_analysis_stochastic.csv")
+      cat("Stability analysis exported to: stability_analysis_stochastic.csv\n")
+    }
+  }
+  
+  # Final Summary Report
+  cat("\n", rep("=", 90), "\n")
+  cat("Comprehensive Analysis Complete\n")
+  cat(rep("=", 90), "\n")
+  
+  cat("Files Created:\n")
+  files_created <- c("comprehensive_malaria_analysis_results.csv",
+                     "model_performance_comprehensive.csv", 
+                     "optimization_methods_comprehensive.csv",
+                     "dataset_complexity_analysis.csv",
+                     "top_20_combinations.csv",
+                     "efficiency_analysis.csv",
+                     "statistical_comparison_summary.csv",
+                     "stability_analysis_stochastic.csv")
+  
+  for (file in files_created) {
+    if (file.exists(file)) {
+      size_kb <- round(file.size(file) / 1024, 1)
+      cat(file, "(", size_kb, "KB)\n")
+    }
+  }
+  
+  if (nrow(valid_results) > 0) {
+    cat("\n Key Findings:\n")
+    
+    # Overall best
+    best_overall <- valid_results[which.max(valid_results$test_f1_score), ]
+    cat("Overall Best F1-Score:", round(best_overall$test_f1_score, 4), "\n")
+    cat("Model:", best_overall$model_name, "\n")
+    cat("Method:", best_overall$optimization_method, "\n")
+    cat("Dataset:", best_overall$dataset, "\n")
+    cat("Training Time:", round(best_overall$training_time_minutes, 2), "minutes\n")
+    
+    # Type comparison
+    type_comp <- valid_results %>%
+      group_by(optimization_type) %>%
+      summarise(
+        mean_f1 = mean(test_f1_score),
+        mean_efficiency = mean(efficiency_score, na.rm = TRUE),
+        mean_time = mean(training_time_minutes),
+        .groups = 'drop'
+      )
+    
+    if (nrow(type_comp) == 2) {
+      winner <- type_comp$optimization_type[which.max(type_comp$mean_f1)]
+      difference <- max(type_comp$mean_f1) - min(type_comp$mean_f1)
+      cat("Winner (Performance):", winner, "methods\n")
+      cat("Performance advantage:", round(difference * 100, 2), "percentage points\n")
+      
+      efficiency_winner <- type_comp$optimization_type[which.max(type_comp$mean_efficiency)]
+      cat("Winner (Efficiency):", efficiency_winner, "methods\n")
+    }
+    
+    # Best model
+    best_model <- valid_results %>% 
+      group_by(model_name) %>% 
+      summarise(mean_f1 = mean(test_f1_score), .groups = 'drop') %>%
+      slice_max(mean_f1, n = 1)
+    cat("Best Model Overall:", best_model$model_name, 
+        "(F1:", round(best_model$mean_f1, 4), ")\n")
+    
+    # Best method
+    best_method <- valid_results %>% 
+      group_by(optimization_method) %>% 
+      summarise(mean_f1 = mean(test_f1_score), .groups = 'drop') %>%
+      slice_max(mean_f1, n = 1)
+    cat("Best Optimization Method:", best_method$optimization_method,
+        "(F1:", round(best_method$mean_f1, 4), ")\n")
+    
+    # Most efficient method
+    most_efficient <- valid_results %>% 
+      group_by(optimization_method) %>% 
+      summarise(mean_efficiency = mean(efficiency_score, na.rm = TRUE), .groups = 'drop') %>%
+      slice_max(mean_efficiency, n = 1)
+    cat("Most Efficient Method:", most_efficient$optimization_method,
+        "(", round(most_efficient$mean_efficiency, 2), "evals/min)\n")
+    
+    # Cross-validation improvement
+    cv_improvement <- valid_results %>%
+      summarise(
+        mean_cv_f1 = mean(cv_f1_score, na.rm = TRUE),
+        mean_test_f1 = mean(test_f1_score, na.rm = TRUE)
+      )
+    
+    if (!is.na(cv_improvement$mean_cv_f1) && !is.na(cv_improvement$mean_test_f1)) {
+      generalization_gap <- cv_improvement$mean_cv_f1 - cv_improvement$mean_test_f1
+      cat("Generalization Gap (CV - Test):", round(generalization_gap, 4), "\n")
+      if (generalization_gap > 0.02) {
+        cat("Potential overfitting detected\n")
+      } else if (generalization_gap < -0.02) {
+        cat("Models generalize well to unseen data\n")
+      } else {
+        cat("Good generalization performance\n")
+      }
+    }
+  }
+  
+} else {
+  cat("No valid results to export\n")
+}
+
+cat("\n Analysis completed successfully!\n")
+```
+
+# Session Information and Reproducibility
+
+```{r session-info}
+cat("\n", rep("=", 80), "\n")
+cat("Session Information\n")
+cat(rep("=", 80), "\n")
+
+# R session info
+cat("R Version:", R.version.string, "\n")
+cat("Date:", Sys.Date(), "\n")
+cat("Time:", format(Sys.time(), "%H:%M:%S"), "\n")
+
+# Package versions
+cat("\n Key Package Version\n")
+key_packages <- c("tidyverse", "tidymodels", "xgboost", "ranger", 
+                  "kernlab", "glmnet", "nnet", "kknn")
+
+for (pkg in key_packages) {
+  if (requireNamespace(pkg, quietly = TRUE)) {
+    version <- packageVersion(pkg)
+    cat(pkg, ":", as.character(version), "\n")
+  }
+}
+
+# System info
+cat("\n System Information:\n")
+cat("Platform:", Sys.info()["sysname"], "\n")
+cat("Machine:", Sys.info()["machine"], "\n")
+cat("CPU Cores:", parallel::detectCores(), "\n")
+
+# Reproducibility info
+cat("\n Reproducibility:\n")
+cat("Global seed: 123\n")
+cat("Cross-validation: 10-fold repeated 5 times\n")
+cat("Data split: 75% train / 25% test (stratified)\n")
+
+cat("\nAnalysis completed successfully!")
+cat("\nAll results have been exported to CSV files for further analysis.")
+```
