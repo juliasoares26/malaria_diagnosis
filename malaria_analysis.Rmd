@@ -271,15 +271,6 @@ generate_malaria_data <- function(n_samples = 1000, scenario = "simple_linear") 
   return(data)
 }
 
-# ── Synthetic data generation specification (Revisor comentário 4) ──────────
-# Mathematical formulation (printed to session log for reproducibility):
-# Let X ~ N(0,1)^{n×p} re-scaled by Cholesky of Σ (nearPD-corrected):
-#   Σ_{ij} = ρ_s × U(0.5, 1.5)  for i≠j, diag = 1
-# Linear predictor: η = X β + ε,  ε ~ N(0, σ_noise)
-# Outcome: Y ~ Bernoulli(σ(η)),  σ = logistic function
-# Nonlinear terms (scenarios 2–4): η += X[,1:3]^2 × [0.3,-0.2,0.4]  (poly)
-#                                     + X[,1]·X[,2]·γ + X[,3]·X[,4]·0.8γ
-#                                     + sin(X[,5])·0.6γ
 # All scenarios use set.seed(123); n=1000 observations, p=12 features.
 # Parameters (β, ρ, σ_noise, γ) are tabulated per scenario below.
 
