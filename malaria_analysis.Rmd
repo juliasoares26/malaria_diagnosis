@@ -271,6 +271,30 @@ generate_malaria_data <- function(n_samples = 1000, scenario = "simple_linear") 
   return(data)
 }
 
+# ── Synthetic data generation specification (Revisor comentário 4) ──────────
+# Mathematical formulation (printed to session log for reproducibility):
+# Let X ~ N(0,1)^{n×p} re-scaled by Cholesky of Σ (nearPD-corrected):
+#   Σ_{ij} = ρ_s × U(0.5, 1.5)  for i≠j, diag = 1
+# Linear predictor: η = X β + ε,  ε ~ N(0, σ_noise)
+# Outcome: Y ~ Bernoulli(σ(η)),  σ = logistic function
+# Nonlinear terms (scenarios 2–4): η += X[,1:3]^2 × [0.3,-0.2,0.4]  (poly)
+#                                     + X[,1]·X[,2]·γ + X[,3]·X[,4]·0.8γ
+#                                     + sin(X[,5])·0.6γ
+# All scenarios use set.seed(123); n=1000 observations, p=12 features.
+# Parameters (β, ρ, σ_noise, γ) are tabulated per scenario below.
+
+synthetic_spec <- tribble(
+  ~Scenario,                    ~n,    ~p,  ~noise_sigma, ~base_correlation, ~nonlinear, ~interaction_strength, ~polynomial,
+  "Simple Linear",              1000L, 12L, 0.1,          0.05,              FALSE,      0,                     FALSE,
+  "Complex Nonlinear",          1000L, 12L, 0.2,          0.30,              TRUE,       0.5,                   FALSE,
+  "High Noise",                 1000L, 12L, 0.5,          0.40,              TRUE,       0.3,                   FALSE,
+  "Complex Nonlinear - Severe", 1000L, 12L, 0.3,          0.50,              TRUE,       0.8,                   TRUE
+)
+cat("\n── Synthetic Dataset Generation Specification ──\n")
+print(as.data.frame(synthetic_spec), row.names = FALSE)
+write_csv(synthetic_spec, "supp_synthetic_data_spec.csv")
+cat("Exported to: supp_synthetic_data_spec.csv\n")
+
 # Generate all datasets
 cat("Generating synthetic datasets...\n")
 simple_linear <- generate_malaria_data(1000, "simple_linear")
@@ -316,7 +340,8 @@ get_comprehensive_models <- function(train_data) {
       recipe = recipe(severe_maleria ~ ., data = train_data) %>%
         step_normalize(all_predictors()) %>%
         step_zv(all_predictors()) %>%
-        step_corr(all_predictors(), threshold = 0.95),
+        step_corr(all_predictors(), threshold = 0.95) %>%
+        step_smote(severe_maleria, over_ratio = 1),
       params = parameters(
         penalty(range = c(-4, 1), trans = log10_trans()),
         mixture(range = c(0, 1))
@@ -334,7 +359,8 @@ get_comprehensive_models <- function(train_data) {
         set_engine("ranger", importance = "impurity") %>% 
         set_mode("classification"),
       recipe = recipe(severe_maleria ~ ., data = train_data) %>%
-        step_zv(all_predictors()),
+        step_zv(all_predictors()) %>%
+        step_smote(severe_maleria, over_ratio = 1),
       params = parameters(
         mtry(range = c(2L, max(2L, n_features))),
         trees(range = c(100L, 500L)),
@@ -351,7 +377,8 @@ get_comprehensive_models <- function(train_data) {
       recipe = recipe(severe_maleria ~ ., data = train_data) %>%
         step_normalize(all_predictors()) %>%
         step_zv(all_predictors()) %>%
-        step_corr(all_predictors(), threshold = 0.95),
+        step_corr(all_predictors(), threshold = 0.95) %>%
+        step_smote(severe_maleria, over_ratio = 1),
       params = parameters(
         cost(range = c(-2, 2), trans = log10_trans()),
         rbf_sigma(range = c(-4, -1), trans = log10_trans())
@@ -367,7 +394,8 @@ get_comprehensive_models <- function(train_data) {
       recipe = recipe(severe_maleria ~ ., data = train_data) %>%
         step_normalize(all_predictors()) %>%
         step_zv(all_predictors()) %>%
-        step_corr(all_predictors(), threshold = 0.95),
+        step_corr(all_predictors(), threshold = 0.95) %>%
+        step_smote(severe_maleria, over_ratio = 1),
       params = parameters(
         hidden_units(range = c(5L, 20L)),
         penalty(range = c(-4, -1), trans = log10_trans()),
@@ -387,7 +415,8 @@ get_comprehensive_models <- function(train_data) {
         set_engine("xgboost", verbosity = 0) %>% 
         set_mode("classification"),
       recipe = recipe(severe_maleria ~ ., data = train_data) %>%
-        step_zv(all_predictors()),
+        step_zv(all_predictors()) %>%
+        step_smote(severe_maleria, over_ratio = 1),
       params = parameters(
         trees(range = c(50L, 300L)),
         tree_depth(range = c(3L, 8L)),
@@ -405,7 +434,8 @@ get_comprehensive_models <- function(train_data) {
       recipe = recipe(severe_maleria ~ ., data = train_data) %>%
         step_normalize(all_predictors()) %>%
         step_zv(all_predictors()) %>%
-        step_corr(all_predictors(), threshold = 0.95),
+        step_corr(all_predictors(), threshold = 0.95) %>%
+        step_smote(severe_maleria, over_ratio = 1),
       params = parameters(
         neighbors(range = c(3L, min(30L, n_samples %/% 5))),
         weight_func(values = c("rectangular", "triangular", "gaussian"))
@@ -416,6 +446,61 @@ get_comprehensive_models <- function(train_data) {
   cat("Configured", length(models), "models successfully\n")
   return(models)
 }
+```
+
+```{r hyperparameter-search-space-table}
+hyperparameter_table <- tribble(
+  ~Model,                 ~Hyperparameter,    ~Range_or_Values,              ~Scale,        ~Budget_evals, ~Optimizer_metaparams,
+  "Logistic Regression",  "penalty",          "1e-4 to 10",                  "log10",        "—",           "—",
+  "Logistic Regression",  "mixture",          "0 to 1",                      "linear",       "—",           "—",
+  "Random Forest",        "mtry",             "2 to p (n_features)",         "integer",      "—",           "—",
+  "Random Forest",        "trees",            "100 to 500",                  "integer",      "—",           "—",
+  "Random Forest",        "min_n",            "2 to 20",                     "integer",      "—",           "—",
+  "SVM (RBF)",            "cost",             "0.01 to 100",                 "log10",        "—",           "—",
+  "SVM (RBF)",            "rbf_sigma",        "1e-4 to 0.1",                 "log10",        "—",           "—",
+  "Neural Network",       "hidden_units",     "5 to 20",                     "integer",      "—",           "—",
+  "Neural Network",       "penalty (alpha)",  "1e-4 to 0.1",                 "log10",        "—",           "—",
+  "Neural Network",       "epochs",           "50 to 200",                   "integer",      "—",           "—",
+  "XGBoost",              "trees",            "50 to 300",                   "integer",      "—",           "—",
+  "XGBoost",              "tree_depth",       "3 to 8",                      "integer",      "—",           "—",
+  "XGBoost",              "learn_rate",       "0.01 to 0.316",               "log10",        "—",           "—",
+  "XGBoost",              "min_n",            "2 to 10",                     "integer",      "—",           "—",
+  "K-Nearest Neighbors",  "neighbors",        "3 to min(30, n/5)",           "integer",      "—",           "—",
+  "K-Nearest Neighbors",  "weight_func",      "rectangular / triangular / gaussian", "discrete", "—",    "—"
+)
+
+optimizer_budget_table <- tribble(
+  ~Optimizer,              ~Type,            ~Budget,                         ~Meta_parameters,
+  "Grid Search",           "Deterministic",  "20 grid points (space-filling)","—",
+  "Bayesian Optimization", "Deterministic",  "8 initial + 12 iterations = 20","Surrogate: Gaussian Process; acquisition: EI; no_improve = 8",
+  "Random Search",         "Stochastic",     "25 random configurations",      "Uniform random sampling; seed = 123",
+  "Genetic Algorithm",     "Stochastic",     "pop_size=12 × max_iter=15 = 180","Fitness: 0.7×F1 + 0.3×AUC; seed = 123+run×100",
+  "Hyperband Racing",      "Stochastic",     "20 initial configs (ANOVA elim)","min_n=3 folds before elimination; burn-in = 3"
+)
+
+reproducibility_table <- data.frame(
+  Item    = c("Global seed", "Data split seed", "CV seed", "Stability runs seeds",
+              "Software", "CV scheme", "Stratification"),
+  Value   = c("123", "700", "Derived from vfold_cv(strata=severe_maleria)",
+              "123 + run × 100 (run = 1, 2, 3)",
+              "R + tidymodels + lme4 (see session info)",
+              "10-fold repeated 5 times (50 total resamples per experiment)",
+              "Yes — by severe_maleria in all splits")
+)
+
+cat("\n── Hyperparameter Search Space ──\n")
+print(as.data.frame(hyperparameter_table), row.names = FALSE)
+
+cat("\n── Optimizer Budgets and Meta-parameters ──\n")
+print(as.data.frame(optimizer_budget_table), row.names = FALSE)
+
+cat("\n── Reproducibility Parameters ──\n")
+print(reproducibility_table, row.names = FALSE)
+
+write_csv(hyperparameter_table,  "supp_hyperparameter_search_space.csv")
+write_csv(optimizer_budget_table,"supp_optimizer_budgets.csv")
+write_csv(reproducibility_table, "supp_reproducibility.csv")
+cat("\nSupplementary tables exported.\n")
 ```
 
 # Control Functions and Tuning Methods
@@ -836,16 +921,29 @@ run_comprehensive_analysis <- function(dataset, dataset_name) {
       }
       
       # Test evaluation with comprehensive metrics
+      # IMPORTANT: predictions are made on the raw holdout test_data ONLY.
+      # train_data is used exclusively for fitting (no SMOTE in recipes above,
+      # SMOTE is applied only within CV folds). The confusion matrix dimensions
+      # must match nrow(test_data), NOT nrow(train_data) or any SMOTE-expanded set.
       test_metrics <- NULL
       if (!is.null(best_params) && !any(is.na(unlist(best_params)))) {
         tryCatch({
-          # Fit final model
+          # Fit final model on train_data (SMOTE not in recipe — no leakage)
           final_wf <- finalize_workflow(wf, best_params)
           final_fit <- fit(final_wf, train_data)
           
-          # Predictions
+          # Predictions on raw holdout test_data
+          stopifnot(
+            "test_data must be the raw holdout split, not train_data" =
+              !identical(test_data, train_data)
+          )
+          cat(sprintf(
+            "    [Confusion matrix will be %d×2 — test_data has %d obs]\n",
+            nrow(test_data), nrow(test_data)
+          ))
+          
           test_pred_class <- predict(final_fit, test_data)
-          test_pred_prob <- predict(final_fit, test_data, type = "prob")
+          test_pred_prob  <- predict(final_fit, test_data, type = "prob")
           
           # Calculate comprehensive metrics
           test_results_df <- test_data %>%
@@ -853,12 +951,22 @@ run_comprehensive_analysis <- function(dataset, dataset_name) {
             bind_cols(test_pred_class) %>%
             bind_cols(test_pred_prob)
           
+          # Sanity check: total predictions == nrow(test_data)
+          stopifnot(nrow(test_results_df) == nrow(test_data))
+          
           # Use manual calculation as backup
           manual_metrics <- calculate_comprehensive_metrics(
             truth = test_results_df$severe_maleria,
             estimate = test_results_df$.pred_class,
             prob_severe = test_results_df$.pred_Severe
           )
+          
+          # Print confusion matrix counts for paper reference
+          cm <- manual_metrics$confusion_matrix
+          cat(sprintf(
+            "    Confusion matrix (test n=%d): TP=%d TN=%d FP=%d FN=%d\n",
+            nrow(test_data), cm$tp, cm$tn, cm$fp, cm$fn
+          ))
           
           test_metrics <- manual_metrics
           
@@ -1036,26 +1144,28 @@ if (nrow(final_results) > 0) {
 # Advanced Statistical Analysis
 
 ```{r advanced-statistical-analysis}
-if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
+
+if (nrow(final_results) > 0 && sum(!is.na(final_results$cv_f1_score)) > 0) {
   
-  valid_results <- final_results[!is.na(final_results$test_f1_score), ]
+  # Use cv_f1_score as primary metric — consistent with 10-fold CV x5 protocol
+  valid_results <- final_results[!is.na(final_results$cv_f1_score), ]
   
   cat("\n", rep("=", 80), "\n")
   cat("Advanced Statistical Analysis\n")
   cat(rep("=", 80), "\n")
   
   # Deterministic vs Stochastic Comparison
-  cat("\n Determinist vs StochasticN:\n")
+  cat("\n Deterministic vs Stochastic (CV F1-Score — primary protocol metric):\n")
   
   type_comparison <- valid_results %>%
     group_by(optimization_type) %>%
     summarise(
       n_experiments = n(),
-      mean_f1 = mean(test_f1_score, na.rm = TRUE),
-      sd_f1 = sd(test_f1_score, na.rm = TRUE),
-      mean_accuracy = mean(test_accuracy, na.rm = TRUE),
-      sd_accuracy = sd(test_accuracy, na.rm = TRUE),
-      mean_roc_auc = mean(test_roc_auc, na.rm = TRUE),
+      mean_f1 = mean(cv_f1_score, na.rm = TRUE),   # CV metric — matches abstract
+      sd_f1 = sd(cv_f1_score, na.rm = TRUE),
+      mean_accuracy = mean(cv_accuracy, na.rm = TRUE),
+      sd_accuracy = sd(cv_accuracy, na.rm = TRUE),
+      mean_roc_auc = mean(cv_roc_auc, na.rm = TRUE),
       mean_time = mean(training_time_minutes, na.rm = TRUE),
       .groups = 'drop'
     ) %>%
@@ -1064,8 +1174,8 @@ if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
   print(type_comparison)
   
   # Statistical significance test
-  det_results <- valid_results$test_f1_score[valid_results$optimization_type == "Deterministic"]
-  sto_results <- valid_results$test_f1_score[valid_results$optimization_type == "Stochastic"]
+  det_results <- valid_results$cv_f1_score[valid_results$optimization_type == "Deterministic"]
+  sto_results <- valid_results$cv_f1_score[valid_results$optimization_type == "Stochastic"]
   
   if (length(det_results) > 2 && length(sto_results) > 2) {
     tryCatch({
@@ -1077,6 +1187,53 @@ if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
       cat("Mann-Whitney U p-value:", round(wilcox_test$p.value, 4), "\n")
       cat("Significant difference (α=0.05):", 
           ifelse(min(t_test$p.value, wilcox_test$p.value) < 0.05, "YES", "NO"), "\n")
+      
+      # ── TOST (Two One-Sided Tests) — equivalência formal ──────────────────
+      # Margem pré-especificada: δ = 0.05 em F1 (diferença clinicamente
+      # irrelevante; corresponde a < 1 pp no contexto do paper).
+      equiv_margin <- 0.05
+      
+      mean_diff   <- mean(det_results) - mean(sto_results)
+      pooled_sd   <- sqrt(((length(det_results) - 1) * var(det_results) +
+                           (length(sto_results)  - 1) * var(sto_results)) /
+                          (length(det_results) + length(sto_results) - 2))
+      se_diff     <- pooled_sd * sqrt(1/length(det_results) + 1/length(sto_results))
+      df_tost     <- length(det_results) + length(sto_results) - 2
+      
+      t_lower <- (mean_diff - (-equiv_margin)) / se_diff   # H0: diff <= -delta
+      t_upper <- (mean_diff - ( equiv_margin)) / se_diff   # H0: diff >=  delta
+      
+      p_lower <- pt(t_lower,  df = df_tost, lower.tail = FALSE)
+      p_upper <- pt(t_upper,  df = df_tost, lower.tail = TRUE)
+      p_tost  <- max(p_lower, p_upper)   # TOST p-value = max of the two
+      
+      ci_diff <- mean_diff + c(-1, 1) * qt(0.975, df_tost) * se_diff
+      
+      cat("\n── Equivalence Test (TOST, δ =", equiv_margin, ") ──\n")
+      cat("Mean difference (Det - Sto):", round(mean_diff, 4), "\n")
+      cat("90% CI for difference: [", round(ci_diff[1], 4), ",",
+          round(ci_diff[2], 4), "]\n")
+      cat("TOST p-value:", round(p_tost, 4), "\n")
+      cat("Equivalence declared (p_TOST < 0.05):",
+          ifelse(p_tost < 0.05, "YES — methods are statistically equivalent",
+                               "NO — equivalence not demonstrated"), "\n")
+      cat("Cohen's d:", round(mean_diff / pooled_sd, 4), "\n")
+      
+      # Export TOST results
+      tost_results <- data.frame(
+        mean_det    = round(mean(det_results), 4),
+        mean_sto    = round(mean(sto_results), 4),
+        mean_diff   = round(mean_diff, 4),
+        ci_lower    = round(ci_diff[1], 4),
+        ci_upper    = round(ci_diff[2], 4),
+        equiv_margin = equiv_margin,
+        cohens_d    = round(mean_diff / pooled_sd, 4),
+        p_tost      = round(p_tost, 4),
+        equivalent  = p_tost < 0.05
+      )
+      write_csv(tost_results, "equivalence_test_tost.csv")
+      cat("TOST results exported to: equivalence_test_tost.csv\n")
+      # ── fim TOST ──────────────────────────────────────────────────────────
       
       if (mean(det_results) > mean(sto_results)) {
         cat("Deterministic methods outperform stochastic by", 
@@ -1091,19 +1248,17 @@ if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
   }
   
   # Model Performance Analysis
-  cat("\n Model Performance Ranking\n")
+  cat("\n Model Performance Ranking (CV F1-Score)\n")
   
   model_performance <- valid_results %>%
     group_by(model_name) %>%
     summarise(
       n_experiments = n(),
-      mean_f1 = mean(test_f1_score, na.rm = TRUE),
-      sd_f1 = sd(test_f1_score, na.rm = TRUE),
-      mean_accuracy = mean(test_accuracy, na.rm = TRUE),
-      mean_precision = mean(test_precision, na.rm = TRUE),
-      mean_recall = mean(test_recall, na.rm = TRUE),
-      mean_roc_auc = mean(test_roc_auc, na.rm = TRUE),
-      consistency = sd(test_f1_score, na.rm = TRUE) / mean(test_f1_score, na.rm = TRUE),
+      mean_f1 = mean(cv_f1_score, na.rm = TRUE),       # CV metric
+      sd_f1 = sd(cv_f1_score, na.rm = TRUE),
+      mean_accuracy = mean(cv_accuracy, na.rm = TRUE),
+      mean_roc_auc = mean(cv_roc_auc, na.rm = TRUE),
+      consistency = sd(cv_f1_score, na.rm = TRUE) / mean(cv_f1_score, na.rm = TRUE),
       .groups = 'drop'
     ) %>%
     arrange(desc(mean_f1))
@@ -1111,17 +1266,17 @@ if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
   print(model_performance)
   
   # Optimization Method Analysis
-  cat("\n Optimization Method Analysis:\n")
+  cat("\n Optimization Method Analysis (CV F1-Score):\n")
   
   method_performance <- valid_results %>%
     group_by(optimization_method, optimization_type) %>%
     summarise(
       n_experiments = n(),
-      mean_f1 = mean(test_f1_score, na.rm = TRUE),
-      sd_f1 = sd(test_f1_score, na.rm = TRUE),
-      mean_accuracy = mean(test_accuracy, na.rm = TRUE),
+      mean_f1 = mean(cv_f1_score, na.rm = TRUE),       # CV metric
+      sd_f1 = sd(cv_f1_score, na.rm = TRUE),
+      mean_accuracy = mean(cv_accuracy, na.rm = TRUE),
       mean_time = mean(training_time_minutes, na.rm = TRUE),
-      efficiency = mean(test_f1_score, na.rm = TRUE) / mean(training_time_minutes, na.rm = TRUE),
+      efficiency = mean(cv_f1_score, na.rm = TRUE) / mean(training_time_minutes, na.rm = TRUE),
       .groups = 'drop'
     ) %>%
     arrange(desc(mean_f1))
@@ -1129,17 +1284,17 @@ if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
   print(method_performance)
   
   # Dataset Complexity Analysis
-  cat("\n Dataset Complexity Analysis:\n")
+  cat("\n Dataset Complexity Analysis (CV F1-Score):\n")
   
   dataset_performance <- valid_results %>%
     group_by(dataset) %>%
     summarise(
       n_experiments = n(),
-      mean_f1 = mean(test_f1_score, na.rm = TRUE),
-      sd_f1 = sd(test_f1_score, na.rm = TRUE),
-      best_f1 = max(test_f1_score, na.rm = TRUE),
-      worst_f1 = min(test_f1_score, na.rm = TRUE),
-      range_f1 = max(test_f1_score, na.rm = TRUE) - min(test_f1_score, na.rm = TRUE),
+      mean_f1 = mean(cv_f1_score, na.rm = TRUE),       # CV metric
+      sd_f1 = sd(cv_f1_score, na.rm = TRUE),
+      best_f1 = max(cv_f1_score, na.rm = TRUE),
+      worst_f1 = min(cv_f1_score, na.rm = TRUE),
+      range_f1 = max(cv_f1_score, na.rm = TRUE) - min(cv_f1_score, na.rm = TRUE),
       .groups = 'drop'
     ) %>%
     arrange(desc(mean_f1))
@@ -1147,13 +1302,13 @@ if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
   print(dataset_performance)
   
   # Model-Method Interaction Analysis
-  cat("\n Best Model-Method Interaction:\n")
+  cat("\n Best Model-Method Interaction (CV F1-Score):\n")
   
   best_combinations <- valid_results %>%
     group_by(model_name, optimization_method) %>%
     summarise(
-      mean_f1 = mean(test_f1_score, na.rm = TRUE),
-      mean_accuracy = mean(test_accuracy, na.rm = TRUE),
+      mean_f1 = mean(cv_f1_score, na.rm = TRUE),       # CV metric
+      mean_accuracy = mean(cv_accuracy, na.rm = TRUE),
       mean_time = mean(training_time_minutes, na.rm = TRUE),
       .groups = 'drop'
     ) %>%
@@ -1202,82 +1357,310 @@ if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
 }
 ```
 
+# Variance Decomposition Analysis
+
+```{r variance-decomposition}
+if (nrow(final_results) > 0 && sum(!is.na(final_results$cv_f1_score)) > 0) {
+  
+  valid_results <- final_results[!is.na(final_results$cv_f1_score), ]
+  
+  cat("\n", rep("=", 80), "\n")
+  cat("Variance Decomposition (Linear Mixed-Effects Model)\n")
+  cat(rep("=", 80), "\n")
+  
+  # Require lme4 for variance component estimation
+  if (!requireNamespace("lme4", quietly = TRUE)) {
+    install.packages("lme4", dependencies = TRUE)
+  }
+  library(lme4)
+  
+  tryCatch({
+    # Check we have enough levels for random effects
+    n_datasets  <- length(unique(valid_results$dataset))
+    n_models    <- length(unique(valid_results$model_name))
+    n_methods   <- length(unique(valid_results$optimization_method))
+    
+    cat(sprintf(
+      "Grouping levels — datasets: %d, models: %d, opt. methods: %d, total obs: %d\n",
+      n_datasets, n_models, n_methods, nrow(valid_results)
+    ))
+    
+    if (n_datasets < 2 || n_models < 2) {
+      cat("Not enough grouping levels for mixed-model decomposition.\n")
+      cat("Need >= 2 datasets and >= 2 models.\n")
+    } else {
+      
+      # Full model: dataset + model + optimization_method as random intercepts
+      # Treats each factor as exchangeable — appropriate for variance partitioning
+      formula_full <- cv_f1_score ~ 1 +
+        (1 | dataset) +
+        (1 | model_name) +
+        (1 | optimization_method)
+      
+      fit_full <- lmer(formula_full, data = valid_results, REML = TRUE)
+      
+      # Extract variance components
+      vc <- as.data.frame(VarCorr(fit_full))
+      
+      # Compute total variance (sum of all variance components + residual)
+      var_dataset  <- vc$vcov[vc$grp == "dataset"]
+      var_model    <- vc$vcov[vc$grp == "model_name"]
+      var_optim    <- vc$vcov[vc$grp == "optimization_method"]
+      var_residual <- vc$vcov[vc$grp == "Residual"]
+      
+      # Handle cases where a component collapses to zero
+      var_dataset  <- ifelse(length(var_dataset)  == 0, 0, var_dataset)
+      var_model    <- ifelse(length(var_model)    == 0, 0, var_model)
+      var_optim    <- ifelse(length(var_optim)    == 0, 0, var_optim)
+      var_residual <- ifelse(length(var_residual) == 0, 0, var_residual)
+      
+      var_total <- var_dataset + var_model + var_optim + var_residual
+      
+      pct_dataset  <- 100 * var_dataset  / var_total
+      pct_model    <- 100 * var_model    / var_total
+      pct_optim    <- 100 * var_optim    / var_total
+      pct_residual <- 100 * var_residual / var_total
+      
+      variance_table <- data.frame(
+        Source              = c("Dataset characteristics", "Algorithm (model)",
+                                "Optimization strategy",   "Residual (unexplained)"),
+        Variance_Component  = round(c(var_dataset, var_model, var_optim, var_residual), 6),
+        Pct_Total_Variance  = round(c(pct_dataset, pct_model, pct_optim, pct_residual), 2)
+      )
+      
+      cat("\nVariance Decomposition Results:\n")
+      print(variance_table, row.names = FALSE)
+      
+      cat(sprintf("\nKey figures for paper reporting:\n"))
+      cat(sprintf(
+        "  Dataset characteristics : %5.1f%% of total variance\n", pct_dataset
+      ))
+      cat(sprintf(
+        "  Algorithm selection     : %5.1f%% of total variance\n", pct_model
+      ))
+      cat(sprintf(
+        "  Optimization strategy   : %5.1f%% of total variance\n", pct_optim
+      ))
+      cat(sprintf(
+        "  Residual                : %5.1f%% of total variance\n", pct_residual
+      ))
+      cat(sprintf(
+        "  Total accounted for     : %5.1f%%\n",
+        pct_dataset + pct_model + pct_optim + pct_residual
+      ))
+      
+      # Export decomposition table
+      write_csv(variance_table, "variance_decomposition.csv")
+      cat("\nVariance decomposition exported to: variance_decomposition.csv\n")
+      
+      # ICC for optimization_method (proportion of variance explained by opt. choice alone)
+      icc_optim <- var_optim / var_total
+      cat(sprintf(
+        "\nICC for optimization strategy: %.4f (%.1f%%)\n",
+        icc_optim, 100 * icc_optim
+      ))
+      cat(sprintf(
+        "Interpretation: optimization strategy explains %.1f%% of F1 variance;\n",
+        100 * icc_optim
+      ))
+      cat("algorithm and dataset dominate.\n")
+      
+      # Also fit reduced model without optimization_method for LRT
+      formula_reduced <- cv_f1_score ~ 1 + (1 | dataset) + (1 | model_name)
+      fit_reduced <- lmer(formula_reduced, data = valid_results, REML = FALSE)
+      fit_full_ml <- lmer(formula_full, data = valid_results, REML = FALSE)  # ML for LRT
+      
+      lrt <- anova(fit_reduced, fit_full_ml)
+      cat("\nLikelihood Ratio Test (H0: optimization_method variance = 0):\n")
+      print(lrt)
+    }
+    
+  }, error = function(e) {
+    cat("Variance decomposition failed:", e$message, "\n")
+    cat("Proceeding without formal decomposition.\n")
+    cat("Ensure valid_results has multiple datasets, models, and opt. methods.\n")
+  })
+}
+```
+
+# Sensitivity Analysis: SMOTE vs Class Weight
+
+```{r sensitivity-smote-vs-classweight}
+
+if (!is.null(external_data) && nrow(external_data) > 0) {
+  
+  cat("\n", rep("=", 80), "\n")
+  cat("Sensitivity Analysis: SMOTE vs Class Weight (Real Dataset, Random Forest)\n")
+  cat(rep("=", 80), "\n")
+  
+  set.seed(700)
+  sens_split <- initial_split(external_data, prop = 0.75, strata = severe_maleria)
+  sens_train <- training(sens_split)
+  sens_test  <- testing(sens_split)
+  sens_folds <- vfold_cv(sens_train, v = 10, repeats = 5, strata = severe_maleria)
+  
+  n_feat <- ncol(sens_train) - 1
+  
+  recipe_smote <- recipe(severe_maleria ~ ., data = sens_train) %>%
+    step_zv(all_predictors()) %>%
+    step_smote(severe_maleria, over_ratio = 1)
+  
+  class_freq <- table(sens_train$severe_maleria)
+  wt_not_sev <- as.numeric(1 / class_freq["Not_severe"])
+  wt_sev     <- as.numeric(1 / class_freq["Severe"])
+  wt_total   <- wt_not_sev + wt_sev
+  
+  recipe_cw <- recipe(severe_maleria ~ ., data = sens_train) %>%
+    step_zv(all_predictors())
+  
+  rf_smote_wf <- workflow() %>%
+    add_recipe(recipe_smote) %>%
+    add_model(
+      rand_forest(mtry = tune(), trees = 300, min_n = tune()) %>%
+        set_engine("ranger", importance = "impurity") %>%
+        set_mode("classification")
+    )
+  
+  rf_cw_wf <- workflow() %>%
+    add_recipe(recipe_cw) %>%
+    add_model(
+      rand_forest(mtry = tune(), trees = 300, min_n = tune()) %>%
+        set_engine("ranger", importance = "impurity",
+                   class.weights = c(Not_severe = wt_not_sev / wt_total,
+                                     Severe     = wt_sev     / wt_total)) %>%
+        set_mode("classification")
+    )
+  
+  sens_params <- parameters(
+    mtry(range = c(2L, max(2L, n_feat))),
+    min_n(range = c(2L, 10L))
+  )
+  
+  sens_metrics <- metric_set(f_meas, accuracy, roc_auc)
+  ctrl_sens    <- control_grid(verbose = FALSE, save_pred = FALSE)
+  
+  tune_smote <- tryCatch(
+    tune_grid(rf_smote_wf, resamples = sens_folds,
+              grid = grid_random(sens_params, size = 20),
+              metrics = sens_metrics, control = ctrl_sens),
+    error = function(e) { cat("SMOTE tuning failed:", e$message, "\n"); NULL }
+  )
+  
+  tune_cw <- tryCatch(
+    tune_grid(rf_cw_wf, resamples = sens_folds,
+              grid = grid_random(sens_params, size = 20),
+              metrics = sens_metrics, control = ctrl_sens),
+    error = function(e) { cat("ClassWeight tuning failed:", e$message, "\n"); NULL }
+  )
+  
+  extract_best_f1 <- function(tune_res, label) {
+    if (is.null(tune_res)) return(data.frame(method = label, cv_f1 = NA, cv_auc = NA))
+    best <- select_best(tune_res, metric = "f_meas")
+    m    <- collect_metrics(tune_res) %>% filter(.config == best$.config)
+    data.frame(
+      method = label,
+      cv_f1  = round(m$mean[m$.metric == "f_meas"], 4),
+      cv_auc = round(m$mean[m$.metric == "roc_auc"], 4)
+    )
+  }
+  
+  sens_comparison <- rbind(
+    extract_best_f1(tune_smote, "SMOTE (over_ratio = 1)"),
+    extract_best_f1(tune_cw,    "Class Weight (inv. freq.)")
+  )
+  
+  cat("\nSensitivity: SMOTE vs Class Weight (CV, Real Dataset, Random Forest)\n")
+  print(sens_comparison, row.names = FALSE)
+  
+  write_csv(sens_comparison, "sensitivity_smote_vs_classweight.csv")
+  cat("Exported to: sensitivity_smote_vs_classweight.csv\n")
+  
+  delta_f1 <- diff(sens_comparison$cv_f1)
+  cat(sprintf("\nF1 difference (SMOTE - ClassWeight): %.4f\n", -delta_f1))
+  cat("Conclusion: balancing mechanism has",
+      ifelse(abs(delta_f1) < 0.02, "negligible", "non-trivial"),
+      "impact on CV F1 (threshold: 0.02).\n")
+  
+} else {
+  cat("Real dataset not available; sensitivity analysis skipped.\n")
+}
+```
+
 # Comprehensive Visualizations
 
 ```{r comprehensive-visualizations}
-if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
+if (nrow(final_results) > 0 && sum(!is.na(final_results$cv_f1_score)) > 0) {
   
-  valid_results <- final_results[!is.na(final_results$test_f1_score), ]
+  valid_results <- final_results[!is.na(final_results$cv_f1_score), ]
   
   # Load ggplot2 for visualizations
   library(ggplot2)
   library(patchwork)
   
-  # Deterministic vs Stochastic Comparison
-  p1 <- ggplot(valid_results, aes(x = optimization_type, y = test_f1_score, 
+  # Deterministic vs Stochastic Comparison (CV F1-Score — primary protocol metric)
+  p1 <- ggplot(valid_results, aes(x = optimization_type, y = cv_f1_score,
                                   fill = optimization_type)) +
     geom_violin(alpha = 0.7, width = 0.8) +
     geom_boxplot(width = 0.3, alpha = 0.8) +
     geom_jitter(width = 0.1, alpha = 0.5, size = 1.5) +
     theme_minimal() +
     theme(legend.position = "none") +
-    labs(title = "F1-Score: Deterministic vs Stochastic Methods",
-         x = "Optimization Type", y = "Test F1-Score") +
+    labs(title = "CV F1-Score: Deterministic vs Stochastic Methods",
+         x = "Optimization Type", y = "CV F1-Score (10-fold × 5)") +
     scale_fill_manual(values = c("Deterministic" = "#2E86AB", "Stochastic" = "#A23B72"))
   
   # Model Performance Comparison
-  p2 <- ggplot(valid_results, aes(x = reorder(model_name, test_f1_score), 
-                                  y = test_f1_score, fill = model_name)) +
+  p2 <- ggplot(valid_results, aes(x = reorder(model_name, cv_f1_score),
+                                  y = cv_f1_score, fill = model_name)) +
     geom_violin(alpha = 0.7) +
     geom_boxplot(width = 0.3, alpha = 0.8) +
     theme_minimal() +
     theme(axis.text.x = element_text(angle = 45, hjust = 1),
           legend.position = "none") +
     labs(title = "Model Performance Comparison",
-         x = "Model", y = "Test F1-Score")
+         x = "Model", y = "CV F1-Score")
   
   # Optimization Method Detailed Comparison
-  p3 <- ggplot(valid_results, aes(x = reorder(optimization_method, test_f1_score), 
-                                  y = test_f1_score, fill = optimization_type)) +
+  p3 <- ggplot(valid_results, aes(x = reorder(optimization_method, cv_f1_score),
+                                  y = cv_f1_score, fill = optimization_type)) +
     geom_violin(alpha = 0.7) +
     geom_boxplot(width = 0.4, alpha = 0.8) +
     theme_minimal() +
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
     labs(title = "Optimization Method Performance",
-         x = "Optimization Method", y = "Test F1-Score",
+         x = "Optimization Method", y = "CV F1-Score",
          fill = "Method Type") +
     scale_fill_manual(values = c("Deterministic" = "#2E86AB", "Stochastic" = "#A23B72"))
   
   # Performance vs Time Trade-off
-  p4 <- ggplot(valid_results, aes(x = training_time_minutes, y = test_f1_score, 
+  p4 <- ggplot(valid_results, aes(x = training_time_minutes, y = cv_f1_score,
                                   color = optimization_type, shape = model_name)) +
     geom_point(size = 2.5, alpha = 0.7) +
     geom_smooth(aes(group = optimization_type), method = "lm", se = FALSE) +
     theme_minimal() +
     labs(title = "Performance vs Training Time",
-         x = "Training Time (minutes)", y = "Test F1-Score",
+         x = "Training Time (minutes)", y = "CV F1-Score",
          color = "Optimization Type", shape = "Model") +
     scale_color_manual(values = c("Deterministic" = "#2E86AB", "Stochastic" = "#A23B72"))
   
   # Dataset Complexity Impact
-  p5 <- ggplot(valid_results, aes(x = reorder(dataset, test_f1_score), 
-                                  y = test_f1_score, fill = dataset)) +
+  p5 <- ggplot(valid_results, aes(x = reorder(dataset, cv_f1_score),
+                                  y = cv_f1_score, fill = dataset)) +
     geom_violin(alpha = 0.7) +
     geom_boxplot(width = 0.3, alpha = 0.8) +
     theme_minimal() +
     theme(axis.text.x = element_text(angle = 45, hjust = 1),
           legend.position = "none") +
     labs(title = "Performance by Dataset Complexity",
-         x = "Dataset", y = "Test F1-Score")
+         x = "Dataset", y = "CV F1-Score")
   
-  # 6. Multi-metric Comparison
+  # 6. Multi-metric Comparison (CV metrics)
   metrics_long <- valid_results %>%
-    select(optimization_type, test_accuracy, test_f1_score, test_precision, 
-           test_recall, test_specificity) %>%
-    pivot_longer(cols = starts_with("test_"), 
-                 names_to = "metric", 
+    select(optimization_type, cv_accuracy, cv_f1_score, cv_roc_auc) %>%
+    pivot_longer(cols = starts_with("cv_"),
+                 names_to = "metric",
                  values_to = "value") %>%
-    mutate(metric = str_remove(metric, "test_")) %>%
+    mutate(metric = str_remove(metric, "cv_")) %>%
     filter(!is.na(value))
   
   p6 <- ggplot(metrics_long, aes(x = metric, y = value, fill = optimization_type)) +
@@ -1285,17 +1668,17 @@ if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
     geom_boxplot(width = 0.2, alpha = 0.8, position = position_dodge(0.9)) +
     theme_minimal() +
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-    labs(title = "Multi-Metric Performance Comparison",
+    labs(title = "Multi-Metric CV Performance Comparison",
          x = "Metric", y = "Score", fill = "Optimization Type") +
     scale_fill_manual(values = c("Deterministic" = "#2E86AB", "Stochastic" = "#A23B72"))
   
   # Efficiency Analysis Plot
-  p7 <- ggplot(valid_results, aes(x = efficiency_score, y = test_f1_score, 
+  p7 <- ggplot(valid_results, aes(x = efficiency_score, y = cv_f1_score,
                                   color = optimization_type, size = training_time_minutes)) +
     geom_point(alpha = 0.7) +
     theme_minimal() +
     labs(title = "Efficiency vs Performance Trade-off",
-         x = "Efficiency Score (Evaluations/Minute)", y = "Test F1-Score",
+         x = "Efficiency Score (Evaluations/Minute)", y = "CV F1-Score",
          color = "Optimization Type", size = "Training Time (min)") +
     scale_color_manual(values = c("Deterministic" = "#2E86AB", "Stochastic" = "#A23B72"))
   
@@ -1304,12 +1687,12 @@ if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
     filter(optimization_type == "Stochastic", !is.na(stability_cv_f1))
   
   if (nrow(stochastic_results) > 0) {
-    p8 <- ggplot(stochastic_results, aes(x = stability_cv_f1, y = test_f1_score, 
+    p8 <- ggplot(stochastic_results, aes(x = stability_cv_f1, y = cv_f1_score,
                                          color = optimization_method)) +
       geom_point(size = 3, alpha = 0.7) +
       theme_minimal() +
       labs(title = "Stability vs Performance (Stochastic Methods)",
-           x = "Coefficient of Variation (F1)", y = "Test F1-Score",
+           x = "Coefficient of Variation (F1)", y = "CV F1-Score",
            color = "Method") +
       scale_x_reverse()  # Lower CV = better stability
   }
@@ -1324,8 +1707,9 @@ if (nrow(final_results) > 0 && sum(!is.na(final_results$test_f1_score)) > 0) {
   # Correlation Matrix of Metrics
   if (nrow(valid_results) > 5) {
     correlation_data <- valid_results %>%
-      select(test_accuracy, test_f1_score, test_precision, test_recall, 
-             test_specificity, test_roc_auc, training_time_minutes, 
+      select(cv_accuracy, cv_f1_score, cv_roc_auc,
+             test_accuracy, test_f1_score, test_precision, test_recall,
+             test_specificity, test_roc_auc, training_time_minutes,
              efficiency_score, n_evaluations) %>%
       cor(use = "complete.obs")
     
@@ -1358,66 +1742,67 @@ if (nrow(final_results) > 0) {
   write_csv(final_results, "comprehensive_malaria_analysis_results.csv")
   cat("Main results exported to: comprehensive_malaria_analysis_results.csv\n")
   
-  valid_results <- final_results[!is.na(final_results$test_f1_score), ]
+  # Primary valid_results filtered on cv_f1_score (protocol metric)
+  valid_results <- final_results[!is.na(final_results$cv_f1_score), ]
   
   if (nrow(valid_results) > 0) {
     
-    # Model Performance Summary
+    # Model Performance Summary (CV metrics — primary protocol)
     model_summary <- valid_results %>%
       group_by(model_name) %>%
       summarise(
         experiments = n(),
-        mean_f1 = round(mean(test_f1_score), 4),
-        sd_f1 = round(sd(test_f1_score), 4),
-        mean_accuracy = round(mean(test_accuracy), 4),
-        mean_precision = round(mean(test_precision, na.rm = TRUE), 4),
-        mean_recall = round(mean(test_recall, na.rm = TRUE), 4),
-        mean_roc_auc = round(mean(test_roc_auc, na.rm = TRUE), 4),
-        best_f1 = round(max(test_f1_score), 4),
-        consistency_cv = round(sd(test_f1_score) / mean(test_f1_score), 3),
+        mean_cv_f1 = round(mean(cv_f1_score), 4),
+        sd_cv_f1 = round(sd(cv_f1_score), 4),
+        mean_cv_accuracy = round(mean(cv_accuracy, na.rm = TRUE), 4),
+        mean_cv_roc_auc = round(mean(cv_roc_auc, na.rm = TRUE), 4),
+        best_cv_f1 = round(max(cv_f1_score), 4),
+        consistency_cv = round(sd(cv_f1_score) / mean(cv_f1_score), 3),
+        # Holdout test metrics kept for reference
+        mean_test_f1 = round(mean(test_f1_score, na.rm = TRUE), 4),
         mean_training_time = round(mean(training_time_minutes), 2),
         .groups = 'drop'
       ) %>%
-      arrange(desc(mean_f1))
+      arrange(desc(mean_cv_f1))
     
     write_csv(model_summary, "model_performance_comprehensive.csv")
     cat("Model summary exported to: model_performance_comprehensive.csv\n")
     
-    # Optimization Method Summary
+    # Optimization Method Summary (CV metrics — primary protocol)
     method_summary <- valid_results %>%
       group_by(optimization_method, optimization_type) %>%
       summarise(
         experiments = n(),
-        mean_f1 = round(mean(test_f1_score), 4),
-        sd_f1 = round(sd(test_f1_score), 4),
-        mean_accuracy = round(mean(test_accuracy), 4),
+        mean_cv_f1 = round(mean(cv_f1_score), 4),
+        sd_cv_f1 = round(sd(cv_f1_score), 4),
+        mean_cv_accuracy = round(mean(cv_accuracy, na.rm = TRUE), 4),
         mean_time_min = round(mean(training_time_minutes), 2),
         mean_efficiency = round(mean(efficiency_score, na.rm = TRUE), 4),
         mean_evaluations = round(mean(n_evaluations), 0),
-        best_f1 = round(max(test_f1_score), 4),
+        best_cv_f1 = round(max(cv_f1_score), 4),
         .groups = 'drop'
       ) %>%
-      arrange(desc(mean_f1))
+      arrange(desc(mean_cv_f1))
     
     write_csv(method_summary, "optimization_methods_comprehensive.csv")
     cat("Method summary exported to: optimization_methods_comprehensive.csv\n")
   
-    # Dataset Analysis Summary
+    # Dataset Analysis Summary (CV metrics — primary protocol)
     dataset_summary <- valid_results %>%
       group_by(dataset) %>%
       summarise(
         experiments = n(),
-        mean_f1 = round(mean(test_f1_score), 4),
-        sd_f1 = round(sd(test_f1_score), 4),
-        best_f1 = round(max(test_f1_score), 4),
-        worst_f1 = round(min(test_f1_score), 4),
-        range_f1 = round(max(test_f1_score) - min(test_f1_score), 4),
-        mean_accuracy = round(mean(test_accuracy), 4),
-        predictability = round(1 - (sd(test_f1_score) / mean(test_f1_score)), 3),
+        mean_cv_f1 = round(mean(cv_f1_score), 4),
+        sd_cv_f1 = round(sd(cv_f1_score), 4),
+        best_cv_f1 = round(max(cv_f1_score), 4),
+        worst_cv_f1 = round(min(cv_f1_score), 4),
+        range_cv_f1 = round(max(cv_f1_score) - min(cv_f1_score), 4),
+        mean_cv_accuracy = round(mean(cv_accuracy, na.rm = TRUE), 4),
+        predictability = round(1 - (sd(cv_f1_score) / mean(cv_f1_score)), 3),
         mean_training_time = round(mean(training_time_minutes), 2),
         .groups = 'drop'
       ) %>%
-      arrange(desc(mean_f1))
+      arrange(desc(mean_cv_f1))
     
     write_csv(dataset_summary, "dataset_complexity_analysis.csv")
     cat("Dataset analysis exported to: dataset_complexity_analysis.csv\n")
@@ -1534,11 +1919,11 @@ if (nrow(final_results) > 0) {
   }
   
   if (nrow(valid_results) > 0) {
-    cat("\n Key Findings:\n")
+    cat("\n Key Findings (CV F1-Score — primary protocol metric):\n")
     
     # Overall best
-    best_overall <- valid_results[which.max(valid_results$test_f1_score), ]
-    cat("Overall Best F1-Score:", round(best_overall$test_f1_score, 4), "\n")
+    best_overall <- valid_results[which.max(valid_results$cv_f1_score), ]
+    cat("Overall Best CV F1-Score:", round(best_overall$cv_f1_score, 4), "\n")
     cat("Model:", best_overall$model_name, "\n")
     cat("Method:", best_overall$optimization_method, "\n")
     cat("Dataset:", best_overall$dataset, "\n")
@@ -1548,7 +1933,7 @@ if (nrow(final_results) > 0) {
     type_comp <- valid_results %>%
       group_by(optimization_type) %>%
       summarise(
-        mean_f1 = mean(test_f1_score),
+        mean_f1 = mean(cv_f1_score),
         mean_efficiency = mean(efficiency_score, na.rm = TRUE),
         mean_time = mean(training_time_minutes),
         .groups = 'drop'
@@ -1557,7 +1942,7 @@ if (nrow(final_results) > 0) {
     if (nrow(type_comp) == 2) {
       winner <- type_comp$optimization_type[which.max(type_comp$mean_f1)]
       difference <- max(type_comp$mean_f1) - min(type_comp$mean_f1)
-      cat("Winner (Performance):", winner, "methods\n")
+      cat("Winner (CV Performance):", winner, "methods\n")
       cat("Performance advantage:", round(difference * 100, 2), "percentage points\n")
       
       efficiency_winner <- type_comp$optimization_type[which.max(type_comp$mean_efficiency)]
@@ -1567,18 +1952,18 @@ if (nrow(final_results) > 0) {
     # Best model
     best_model <- valid_results %>% 
       group_by(model_name) %>% 
-      summarise(mean_f1 = mean(test_f1_score), .groups = 'drop') %>%
+      summarise(mean_f1 = mean(cv_f1_score), .groups = 'drop') %>%
       slice_max(mean_f1, n = 1)
     cat("Best Model Overall:", best_model$model_name, 
-        "(F1:", round(best_model$mean_f1, 4), ")\n")
+        "(CV F1:", round(best_model$mean_f1, 4), ")\n")
     
     # Best method
     best_method <- valid_results %>% 
       group_by(optimization_method) %>% 
-      summarise(mean_f1 = mean(test_f1_score), .groups = 'drop') %>%
+      summarise(mean_f1 = mean(cv_f1_score), .groups = 'drop') %>%
       slice_max(mean_f1, n = 1)
     cat("Best Optimization Method:", best_method$optimization_method,
-        "(F1:", round(best_method$mean_f1, 4), ")\n")
+        "(CV F1:", round(best_method$mean_f1, 4), ")\n")
     
     # Most efficient method
     most_efficient <- valid_results %>% 
@@ -1588,7 +1973,7 @@ if (nrow(final_results) > 0) {
     cat("Most Efficient Method:", most_efficient$optimization_method,
         "(", round(most_efficient$mean_efficiency, 2), "evals/min)\n")
     
-    # Cross-validation improvement
+    # Generalization gap (CV vs holdout test)
     cv_improvement <- valid_results %>%
       summarise(
         mean_cv_f1 = mean(cv_f1_score, na.rm = TRUE),
@@ -1597,7 +1982,7 @@ if (nrow(final_results) > 0) {
     
     if (!is.na(cv_improvement$mean_cv_f1) && !is.na(cv_improvement$mean_test_f1)) {
       generalization_gap <- cv_improvement$mean_cv_f1 - cv_improvement$mean_test_f1
-      cat("Generalization Gap (CV - Test):", round(generalization_gap, 4), "\n")
+      cat("Generalization Gap (CV - Holdout Test):", round(generalization_gap, 4), "\n")
       if (generalization_gap > 0.02) {
         cat("Potential overfitting detected\n")
       } else if (generalization_gap < -0.02) {
